@@ -31,7 +31,6 @@ HEADERS = [
     "platform",
     "source_type",
     "ad_id",
-    "ad_name",
 ]
 
 STATUS_HEADERS = ["time", "status", "message"]
@@ -164,6 +163,30 @@ def clear_values(service, spreadsheet_id: str, range_name: str) -> None:
     ).execute()
 
 
+def delete_columns(service, spreadsheet_id: str, sheet_name: str, start_column: int, end_column: int) -> None:
+    metadata = get_spreadsheet(service, spreadsheet_id)
+    sheet = find_sheet(metadata, sheet_name)
+    if not sheet or end_column < start_column:
+        return
+
+    batch_update(
+        service,
+        spreadsheet_id,
+        [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet["sheetId"],
+                        "dimension": "COLUMNS",
+                        "startIndex": start_column - 1,
+                        "endIndex": end_column,
+                    }
+                }
+            }
+        ],
+    )
+
+
 def append_values(service, spreadsheet_id: str, range_name: str, values: list[list[Any]]) -> None:
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
@@ -273,7 +296,7 @@ def migrate_headers(service, spreadsheet_id: str, sheet_name: str, desired_heade
         freeze_first_row(service, spreadsheet_id, sheet_name)
         return
 
-    if current_headers[:width] == desired_headers:
+    if current_headers[:width] == desired_headers and not any(current_headers[width:]):
         freeze_first_row(service, spreadsheet_id, sheet_name)
         return
 
@@ -310,6 +333,7 @@ def migrate_headers(service, spreadsheet_id: str, sheet_name: str, desired_heade
         )
     if source_width > width:
         clear_values(service, spreadsheet_id, sheet_range(sheet_name, f"{col_letter(width + 1)}:{col_letter(source_width)}"))
+        delete_columns(service, spreadsheet_id, sheet_name, width + 1, source_width)
     freeze_first_row(service, spreadsheet_id, sheet_name)
 
 
@@ -581,7 +605,7 @@ def fetch_facebook_object(object_id: str, access_token: str):
     )
 
 
-def add_facebook_comment_row(rows, seen, post, comment, parent_id, since_date, until_date, source_type, ad_id, ad_name):
+def add_facebook_comment_row(rows, seen, post, comment, parent_id, since_date, until_date, source_type, ad_id):
     row_key = make_row_key("facebook", source_type or "organic", ad_id or "", comment.get("id", ""))
     if not comment.get("id") or row_key in seen:
         return
@@ -608,12 +632,11 @@ def add_facebook_comment_row(rows, seen, post, comment, parent_id, since_date, u
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "source_type": source_type or "organic",
             "ad_id": ad_id or "",
-            "ad_name": ad_name or "",
         }
     )
 
 
-def add_instagram_comment_row(rows, seen, media, comment, parent_id, since_date, until_date, source_type, ad_id, ad_name):
+def add_instagram_comment_row(rows, seen, media, comment, parent_id, since_date, until_date, source_type, ad_id):
     row_key = make_row_key("instagram", source_type or "organic", ad_id or "", comment.get("id", ""))
     if not comment.get("id") or row_key in seen:
         return
@@ -640,7 +663,6 @@ def add_instagram_comment_row(rows, seen, media, comment, parent_id, since_date,
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "source_type": source_type or "organic",
             "ad_id": ad_id or "",
-            "ad_name": ad_name or "",
         }
     )
 
@@ -676,12 +698,12 @@ def sync_meta_comments_daily() -> None:
         comments = post.get("comments", {}).get("data", [])
         facebook_comments += len(comments)
         for comment in comments:
-            add_facebook_comment_row(rows, seen, post, comment, "", comment_since, now, "organic", "", "")
+            add_facebook_comment_row(rows, seen, post, comment, "", comment_since, now, "organic", "")
 
             replies = comment.get("comments", {}).get("data", [])
             facebook_replies += len(replies)
             for reply in replies:
-                add_facebook_comment_row(rows, seen, post, reply, comment.get("id", ""), comment_since, now, "organic", "", "")
+                add_facebook_comment_row(rows, seen, post, reply, comment.get("id", ""), comment_since, now, "organic", "")
 
     media = fetch_instagram_media_with_comments(CONFIG["ig_user_id"], access_token)
     write_status(service, spreadsheet_id, "RUNNING", f"Fetched {len(media)} recent Instagram media items. Preparing rows...")
@@ -695,7 +717,7 @@ def sync_meta_comments_daily() -> None:
         instagram_comments += len(comments)
 
         for comment in comments:
-            add_instagram_comment_row(rows, seen, item, comment, "", comment_since, now, "organic", "", "")
+            add_instagram_comment_row(rows, seen, item, comment, "", comment_since, now, "organic", "")
 
             replies = [
                 reply
@@ -704,7 +726,7 @@ def sync_meta_comments_daily() -> None:
             ]
             instagram_replies += len(replies)
             for reply in replies:
-                add_instagram_comment_row(rows, seen, item, reply, comment.get("id", ""), comment_since, now, "organic", "", "")
+                add_instagram_comment_row(rows, seen, item, reply, comment.get("id", ""), comment_since, now, "organic", "")
 
     ads = fetch_ads(CONFIG["ad_account_id"], access_token)
     write_status(service, spreadsheet_id, "RUNNING", f"Fetched {len(ads)} ads. Looking for ad post/media comments...")
@@ -733,7 +755,6 @@ def sync_meta_comments_daily() -> None:
                     now,
                     "ad",
                     ad.get("id", ""),
-                    ad.get("name", ""),
                 )
 
                 replies = fetch_comments(comment.get("id", ""), comment_since, now, page_access_token)
@@ -749,7 +770,6 @@ def sync_meta_comments_daily() -> None:
                         now,
                         "ad",
                         ad.get("id", ""),
-                        ad.get("name", ""),
                     )
 
         if creative.get("effective_instagram_media_id"):
@@ -772,7 +792,6 @@ def sync_meta_comments_daily() -> None:
                     now,
                     "ad",
                     ad.get("id", ""),
-                    ad.get("name", ""),
                 )
 
                 replies = [
@@ -792,7 +811,6 @@ def sync_meta_comments_daily() -> None:
                         now,
                         "ad",
                         ad.get("id", ""),
-                        ad.get("name", ""),
                     )
 
     upsert_rows(service, spreadsheet_id, rows)
