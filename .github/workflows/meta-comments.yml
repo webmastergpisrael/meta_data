@@ -1,0 +1,64 @@
+name: Meta data sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_facebook_posts:
+        description: "How many Facebook posts to fetch"
+        required: false
+        default: "1"
+      max_instagram_media:
+        description: "How many Instagram media items to fetch"
+        required: false
+        default: "1"
+      max_ads:
+        description: "How many paid ads to fetch"
+        required: false
+        default: "0"
+      max_comments_per_post:
+        description: "How many top-level comments per post/media/ad"
+        required: false
+        default: "5"
+      max_replies_per_comment:
+        description: "How many replies per top-level comment"
+        required: false
+        default: "2"
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync Meta data to Google Sheets
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          MAX_FACEBOOK_POSTS: ${{ github.event.inputs.max_facebook_posts || vars.MAX_FACEBOOK_POSTS || '1' }}
+          MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
+          MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '0' }}
+          MAX_COMMENTS_PER_POST: ${{ github.event.inputs.max_comments_per_post || vars.MAX_COMMENTS_PER_POST || '5' }}
+          MAX_REPLIES_PER_COMMENT: ${{ github.event.inputs.max_replies_per_comment || vars.MAX_REPLIES_PER_COMMENT || '2' }}
+          COMMENT_LOOKBACK_DAYS: ${{ vars.COMMENT_LOOKBACK_DAYS || '7' }}
+          POST_LOOKBACK_DAYS: ${{ vars.POST_LOOKBACK_DAYS || '14' }}
+          GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '20' }}
+          ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
+          ANALYZE_WITH_GEMINI: "true"
+          TIMEZONE: Asia/Jerusalem
+        run: python sync_meta_analysis.py
