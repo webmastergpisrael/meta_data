@@ -894,13 +894,27 @@ def make_post_row(
 
 def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     api_key = required_env("GEMINI_API_KEY")
-    url, payload, headers = gemini_request(prompt, api_key)
     print(
         "Gemini request: "
         f"mode={CONFIG['gemini_api_mode']}, "
         f"model={CONFIG['gemini_model']}, "
         f"prompt_chars={len(prompt)}"
     )
+    result = gemini_generate_json_with_mode(prompt, api_key, CONFIG["gemini_api_mode"])
+    if result is not None:
+        return result
+
+    if CONFIG["gemini_api_mode"] != "generateContent":
+        print("Gemini interactions did not return valid JSON. Trying generateContent fallback once...")
+        result = gemini_generate_json_with_mode(prompt, api_key, "generateContent")
+        if result is not None:
+            return result
+
+    return gemini_fallback_or_raise("Gemini did not return valid JSON.")
+
+
+def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict[str, Any] | None:
+    url, payload, headers = gemini_request(prompt, api_key, mode)
     retryable_statuses = {429, 500, 502, 503, 504}
     max_retries = max(0, CONFIG["gemini_max_retries"])
 
@@ -910,7 +924,8 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
             data = response.json() if response.text else {}
         except (requests.RequestException, ValueError) as exc:
             if attempt >= max_retries:
-                return gemini_fallback_or_raise(f"Gemini request failed: {exc}")
+                print(f"WARNING: Gemini {mode} request failed: {exc}")
+                return None
             sleep_before_gemini_retry(attempt)
             continue
 
@@ -918,18 +933,21 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
             try:
                 return extract_gemini_json(data)
             except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-                return gemini_fallback_or_raise(f"Gemini returned invalid JSON: {exc}")
+                print(f"WARNING: Gemini {mode} returned invalid JSON: {exc}")
+                print(f"Gemini {mode} response shape: {gemini_response_shape(data)}")
+                return None
 
         message = json.dumps(data, ensure_ascii=False)[:1000]
         if response.status_code not in retryable_statuses or attempt >= max_retries:
-            return gemini_fallback_or_raise(f"Gemini API error {response.status_code}: {message}")
+            print(f"WARNING: Gemini {mode} API error {response.status_code}: {message}")
+            return None
         sleep_before_gemini_retry(attempt)
 
-    return gemini_fallback_or_raise("Gemini API failed after retries.")
+    return None
 
 
-def gemini_request(prompt: str, api_key: str) -> tuple[str, dict[str, Any], dict[str, str]]:
-    if CONFIG["gemini_api_mode"] == "interactions":
+def gemini_request(prompt: str, api_key: str, mode: str) -> tuple[str, dict[str, Any], dict[str, str]]:
+    if mode == "interactions":
         return (
             "https://generativelanguage.googleapis.com/v1beta/interactions",
             {
@@ -976,6 +994,21 @@ def extract_gemini_json(data: dict[str, Any]) -> dict[str, Any]:
         if start != -1 and end != -1 and end > start:
             text = text[start : end + 1]
     return json.loads(text)
+
+
+def gemini_response_shape(data: dict[str, Any]) -> str:
+    if not isinstance(data, dict):
+        return type(data).__name__
+    shape = {key: type(value).__name__ for key, value in data.items()}
+    if data.get("output") and isinstance(data["output"], list):
+        shape["output_types"] = [
+            output.get("type", type(output).__name__)
+            for output in data["output"][:5]
+            if isinstance(output, dict)
+        ]
+    if data.get("candidates") and isinstance(data["candidates"], list):
+        shape["candidates_count"] = len(data["candidates"])
+    return json.dumps(shape, ensure_ascii=False)
 
 
 def sleep_before_gemini_retry(attempt: int) -> None:
