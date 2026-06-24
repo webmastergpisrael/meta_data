@@ -50,6 +50,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash-lite' }}
+          GEMINI_API_MODE: ${{ vars.GEMINI_API_MODE || 'interactions' }}
           MAX_FACEBOOK_POSTS: ${{ github.event.inputs.max_facebook_posts || vars.MAX_FACEBOOK_POSTS || '1' }}
           MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
           MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '0' }}
