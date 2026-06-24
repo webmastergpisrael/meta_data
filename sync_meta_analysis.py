@@ -141,6 +141,7 @@ CONFIG = {
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", True),
     "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash-lite"),
     "gemini_api_mode": env_value("GEMINI_API_MODE", "interactions"),
+    "gemini_fallback_after_quota_error": env_bool("GEMINI_FALLBACK_AFTER_QUOTA_ERROR", False),
     "greenpeace_facebook_page_id": "",
     "greenpeace_instagram_username": "",
 }
@@ -895,19 +896,23 @@ def make_post_row(
 def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     api_key = required_env("GEMINI_API_KEY")
     result = gemini_generate_json_with_mode(prompt, api_key, CONFIG["gemini_api_mode"])
-    if result is not None:
+    if result == "__quota_exhausted__":
+        return gemini_fallback_or_raise("Gemini quota exhausted.")
+    if isinstance(result, dict):
         return result
 
     if CONFIG["gemini_api_mode"] != "generateContent":
         print("Gemini interactions did not return valid JSON. Trying generateContent fallback once...")
         result = gemini_generate_json_with_mode(prompt, api_key, "generateContent")
-        if result is not None:
+        if result == "__quota_exhausted__":
+            return gemini_fallback_or_raise("Gemini quota exhausted.")
+        if isinstance(result, dict):
             return result
 
     return gemini_fallback_or_raise("Gemini did not return valid JSON.")
 
 
-def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict[str, Any] | None:
+def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict[str, Any] | str | None:
     url, payload, headers = gemini_request(prompt, api_key, mode)
     print(
         "Gemini request: "
@@ -938,6 +943,9 @@ def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict
                 return None
 
         message = json.dumps(data, ensure_ascii=False)[:1000]
+        if response.status_code == 429 and not CONFIG["gemini_fallback_after_quota_error"]:
+            print(f"WARNING: Gemini {mode} quota/rate limit error 429: {message}")
+            return "__quota_exhausted__"
         if response.status_code not in retryable_statuses or attempt >= max_retries:
             print(f"WARNING: Gemini {mode} API error {response.status_code}: {message}")
             return None
