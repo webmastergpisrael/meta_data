@@ -1019,7 +1019,23 @@ def extract_gemini_json(data: dict[str, Any]) -> dict[str, Any]:
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
             text = text[start : end + 1]
-    return json.loads(text)
+    return parse_first_json_object(text)
+
+
+def parse_first_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    stripped = text.strip()
+    try:
+        value, _ = decoder.raw_decode(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        if start == -1:
+            raise
+        value, _ = decoder.raw_decode(stripped[start:])
+
+    if not isinstance(value, dict):
+        raise json.JSONDecodeError("Gemini JSON response is not an object", stripped, 0)
+    return value
 
 
 def gemini_response_shape(data: dict[str, Any]) -> str:
