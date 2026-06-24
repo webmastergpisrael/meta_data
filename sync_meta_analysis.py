@@ -136,10 +136,10 @@ CONFIG = {
     "max_replies_per_comment": env_int("MAX_REPLIES_PER_COMMENT", 2),
     "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 20),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
-    "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 4),
+    "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 0),
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 15),
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", True),
-    "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash"),
+    "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash-lite"),
     "greenpeace_facebook_page_id": "",
     "greenpeace_instagram_username": "",
 }
