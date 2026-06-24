@@ -140,6 +140,7 @@ CONFIG = {
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 15),
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", True),
     "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+    "gemini_api_mode": env_value("GEMINI_API_MODE", "interactions"),
     "greenpeace_facebook_page_id": "",
     "greenpeace_instagram_username": "",
 }
@@ -272,6 +273,23 @@ def header_map(service, spreadsheet_id: str, sheet_name: str, headers: list[str]
     rows = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A1:{col_letter(len(headers))}1"))
     row = rows[0] if rows else []
     return {str(header).strip(): index + 1 for index, header in enumerate(row) if header}
+
+
+def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[str], id_field: str) -> set[str]:
+    ensure_sheet(service, spreadsheet_id, sheet_name, headers)
+    mapping = header_map(service, spreadsheet_id, sheet_name, headers)
+    id_column = mapping.get(id_field)
+    if not id_column:
+        return set()
+
+    rows = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"))
+    output = set()
+    for row in rows:
+        padded = pad_row(row, len(headers))
+        value = str(padded[id_column - 1] or "").strip()
+        if value:
+            output.add(value)
+    return output
 
 
 def upsert_by_key(
@@ -474,17 +492,6 @@ def discover_meta_context(access_token: str) -> dict[str, str]:
 
 
 def facebook_post_fields(comment_since: datetime, until: datetime) -> str:
-    comment_since_unix = to_unix(comment_since)
-    until_unix = to_unix(until)
-    replies = (
-        f"comments.limit({CONFIG['max_replies_per_comment']})"
-        f"{{{FACEBOOK_COMMENT_FIELDS}}}"
-    )
-    comments = (
-        f"comments.since({comment_since_unix}).until({until_unix}).filter(stream)"
-        f".order(chronological).limit({CONFIG['max_comments_per_post']})"
-        f"{{{FACEBOOK_COMMENT_FIELDS},{replies}}}"
-    )
     return ",".join(
         [
             "id",
@@ -494,7 +501,6 @@ def facebook_post_fields(comment_since: datetime, until: datetime) -> str:
             "attachments{media_type,type}",
             "reactions.limit(0).summary(true)",
             "likes.limit(0).summary(true)",
-            comments,
         ]
     )
 
@@ -518,14 +524,6 @@ def fetch_facebook_posts(page_id: str, post_since: datetime, until: datetime, co
 def fetch_instagram_media(ig_user_id: str, access_token: str):
     if not ig_user_id or CONFIG["max_instagram_media"] <= 0:
         return []
-    replies = (
-        f"replies.limit({CONFIG['max_replies_per_comment']})"
-        "{id,text,timestamp,username,like_count}"
-    )
-    comments = (
-        f"comments.limit({CONFIG['max_comments_per_post']})"
-        f"{{id,text,timestamp,username,like_count,{replies}}}"
-    )
     fields = ",".join(
         [
             "id",
@@ -535,7 +533,6 @@ def fetch_instagram_media(ig_user_id: str, access_token: str):
             "media_type",
             "like_count",
             "comments_count",
-            comments,
         ]
     )
     return get_all_pages(
@@ -544,6 +541,37 @@ def fetch_instagram_media(ig_user_id: str, access_token: str):
         access_token,
         CONFIG["max_instagram_media"],
     )
+
+
+def fetch_facebook_comments_with_replies(object_id: str, since_date: datetime, until_date: datetime, access_token: str):
+    replies = f"comments.limit({CONFIG['max_replies_per_comment']}){{{FACEBOOK_COMMENT_FIELDS}}}"
+    fields = f"{FACEBOOK_COMMENT_FIELDS},{replies}"
+    comments = get_all_pages(
+        f"/{object_id}/comments",
+        {
+            "fields": fields,
+            "filter": "stream",
+            "order": "chronological",
+            "since": to_unix(since_date),
+            "until": to_unix(until_date),
+            "limit": CONFIG["max_comments_per_post"],
+        },
+        access_token,
+        CONFIG["max_comments_per_post"],
+    )
+    return [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
+
+
+def fetch_instagram_comments(media_id: str, since_date: datetime, until_date: datetime, access_token: str):
+    replies = f"replies.limit({CONFIG['max_replies_per_comment']}){{id,text,timestamp,username,like_count}}"
+    fields = f"id,text,timestamp,username,like_count,{replies}"
+    comments = get_all_pages(
+        f"/{media_id}/comments",
+        {"fields": fields, "limit": CONFIG["max_comments_per_post"]},
+        access_token,
+        CONFIG["max_comments_per_post"],
+    )
+    return [comment for comment in comments if is_within(comment.get("timestamp", ""), since_date, until_date)]
 
 
 def fetch_ads(ad_account_id: str, access_token: str):
@@ -691,7 +719,12 @@ def add_comment(
     )
 
 
-def collect_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def collect_rows(
+    existing_post_ids: set[str] | None = None,
+    existing_comment_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    existing_post_ids = existing_post_ids or set()
+    existing_comment_ids = existing_comment_ids or set()
     access_token = meta_access_token()
     now = datetime.now(timezone.utc)
     post_since = now - timedelta(days=CONFIG["post_lookback_days"])
@@ -701,11 +734,14 @@ def collect_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
     posts: list[dict[str, Any]] = []
     comments: list[dict[str, Any]] = []
-    seen_comments: set[str] = set()
+    seen_comments: set[str] = set(existing_comment_ids)
 
     for post in fetch_facebook_posts(meta_context["page_id"], post_since, now, comment_since, page_token):
         post_id = post.get("id", "")
-        post_comments = post.get("comments", {}).get("data", [])
+        if not post_id or post_id in existing_post_ids:
+            continue
+
+        post_comments = fetch_facebook_comments_with_replies(post_id, comment_since, now, page_token)
         for comment in post_comments:
             add_comment(comments, seen_comments, "facebook", post_id, comment, "", post.get("permalink_url", ""))
             for reply in comment.get("comments", {}).get("data", []):
@@ -731,11 +767,10 @@ def collect_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
     for media in fetch_instagram_media(meta_context["ig_user_id"], access_token):
         post_id = media.get("id", "")
-        post_comments = [
-            comment
-            for comment in media.get("comments", {}).get("data", [])
-            if is_within(comment.get("timestamp", ""), comment_since, now)
-        ]
+        if not post_id or post_id in existing_post_ids:
+            continue
+
+        post_comments = fetch_instagram_comments(post_id, comment_since, now, access_token)
         for comment in post_comments:
             add_comment(comments, seen_comments, "instagram", post_id, comment, "", media.get("permalink", ""))
             for reply in comment.get("replies", {}).get("data", []):
@@ -766,50 +801,52 @@ def collect_rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         ad_id = ad.get("id", "")
         if creative.get("effective_object_story_id"):
             object_id = creative["effective_object_story_id"]
-            ad_post = fetch_facebook_object(object_id, page_token)
-            ad_comments = fetch_facebook_comments(object_id, comment_since, now, page_token)
-            for comment in ad_comments:
-                add_comment(comments, seen_comments, "facebook", object_id, comment, "", ad_post.get("permalink_url", ""))
-            posts.append(
-                make_post_row(
-                    post_id=object_id,
-                    platform="facebook",
-                    created_time=ad_post.get("created_time", ""),
-                    message=ad_post.get("message", ""),
-                    url=ad_post.get("permalink_url", ""),
-                    source_type="paid",
-                    campaign_name=campaign_name,
-                    ad_id=ad_id,
-                    media_type=media_type_from_facebook(ad_post),
-                    like_count=first_summary_total(ad_post, "reactions") or first_summary_total(ad_post, "likes"),
-                    collected_window_start=comment_since,
-                    collected_window_end=now,
-                    comments=[comment for comment in comments if comment["post_id"] == object_id],
+            if object_id not in existing_post_ids:
+                ad_post = fetch_facebook_object(object_id, page_token)
+                ad_comments = fetch_facebook_comments(object_id, comment_since, now, page_token)
+                for comment in ad_comments:
+                    add_comment(comments, seen_comments, "facebook", object_id, comment, "", ad_post.get("permalink_url", ""))
+                posts.append(
+                    make_post_row(
+                        post_id=object_id,
+                        platform="facebook",
+                        created_time=ad_post.get("created_time", ""),
+                        message=ad_post.get("message", ""),
+                        url=ad_post.get("permalink_url", ""),
+                        source_type="paid",
+                        campaign_name=campaign_name,
+                        ad_id=ad_id,
+                        media_type=media_type_from_facebook(ad_post),
+                        like_count=first_summary_total(ad_post, "reactions") or first_summary_total(ad_post, "likes"),
+                        collected_window_start=comment_since,
+                        collected_window_end=now,
+                        comments=[comment for comment in comments if comment["post_id"] == object_id],
+                    )
                 )
-            )
         if creative.get("effective_instagram_media_id"):
             media_id = creative["effective_instagram_media_id"]
-            ad_media = fetch_instagram_media_by_id(media_id, access_token)
-            for comment in ad_media.get("comments", {}).get("data", []):
-                if is_within(comment.get("timestamp", ""), comment_since, now):
-                    add_comment(comments, seen_comments, "instagram", media_id, comment, "", ad_media.get("permalink", ""))
-            posts.append(
-                make_post_row(
-                    post_id=media_id,
-                    platform="instagram",
-                    created_time=ad_media.get("timestamp", ""),
-                    message=ad_media.get("caption", ""),
-                    url=ad_media.get("permalink", ""),
-                    source_type="paid",
-                    campaign_name=campaign_name,
-                    ad_id=ad_id,
-                    media_type=media_type_from_instagram(ad_media),
-                    like_count=ad_media.get("like_count", 0),
-                    collected_window_start=comment_since,
-                    collected_window_end=now,
-                    comments=[comment for comment in comments if comment["post_id"] == media_id],
+            if media_id not in existing_post_ids:
+                ad_media = fetch_instagram_media_by_id(media_id, access_token)
+                for comment in ad_media.get("comments", {}).get("data", []):
+                    if is_within(comment.get("timestamp", ""), comment_since, now):
+                        add_comment(comments, seen_comments, "instagram", media_id, comment, "", ad_media.get("permalink", ""))
+                posts.append(
+                    make_post_row(
+                        post_id=media_id,
+                        platform="instagram",
+                        created_time=ad_media.get("timestamp", ""),
+                        message=ad_media.get("caption", ""),
+                        url=ad_media.get("permalink", ""),
+                        source_type="paid",
+                        campaign_name=campaign_name,
+                        ad_id=ad_id,
+                        media_type=media_type_from_instagram(ad_media),
+                        like_count=ad_media.get("like_count", 0),
+                        collected_window_start=comment_since,
+                        collected_window_end=now,
+                        comments=[comment for comment in comments if comment["post_id"] == media_id],
+                    )
                 )
-            )
 
     return posts, comments
 
@@ -857,24 +894,13 @@ def make_post_row(
 
 def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     api_key = required_env("GEMINI_API_KEY")
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{CONFIG['gemini_model']}:generateContent?key={api_key}"
-    )
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
-        },
-    }
+    url, payload, headers = gemini_request(prompt, api_key)
     retryable_statuses = {429, 500, 502, 503, 504}
     max_retries = max(0, CONFIG["gemini_max_retries"])
 
     for attempt in range(max_retries + 1):
         try:
-            response = requests.post(url, json=payload, timeout=120)
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
             data = response.json() if response.text else {}
         except (requests.RequestException, ValueError) as exc:
             if attempt >= max_retries:
@@ -883,8 +909,10 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
             continue
 
         if response.ok:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
+            try:
+                return extract_gemini_json(data)
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                return gemini_fallback_or_raise(f"Gemini returned invalid JSON: {exc}")
 
         message = json.dumps(data, ensure_ascii=False)[:1000]
         if response.status_code not in retryable_statuses or attempt >= max_retries:
@@ -892,6 +920,56 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         sleep_before_gemini_retry(attempt)
 
     return gemini_fallback_or_raise("Gemini API failed after retries.")
+
+
+def gemini_request(prompt: str, api_key: str) -> tuple[str, dict[str, Any], dict[str, str]]:
+    if CONFIG["gemini_api_mode"] == "interactions":
+        return (
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            {
+                "model": CONFIG["gemini_model"],
+                "input": prompt,
+            },
+            {
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+            },
+        )
+
+    return (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{CONFIG['gemini_model']}:generateContent?key={api_key}",
+        {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        },
+        {"Content-Type": "application/json"},
+    )
+
+
+def extract_gemini_json(data: dict[str, Any]) -> dict[str, Any]:
+    text = ""
+    if data.get("candidates"):
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    elif data.get("output"):
+        for output in data.get("output", []):
+            for content in output.get("content", []):
+                if content.get("type") == "text" and content.get("text"):
+                    text += content["text"]
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+    return json.loads(text)
 
 
 def sleep_before_gemini_retry(attempt: int) -> None:
@@ -951,7 +1029,10 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
         for post in posts
     ]
     prompt = (
-        "Analyze Greenpeace Israel social posts. Return only the JSON requested by the schema. "
+        "Analyze Greenpeace Israel social posts. Return only valid JSON in this exact shape: "
+        '{"posts":[{"post_id":"...","canonical_topic":"...","canonical_subtopic":"...",'
+        '"topic_source":"hashtags|campaign_name|ad_text|ai_classification|manual|unknown",'
+        '"topic_confidence":0.0,"post_emotions":["Neutral"]}]}. '
         "Use short snake_case English labels for canonical_topic and canonical_subtopic. "
         "topic_source must indicate the strongest source used: hashtags, campaign_name, ad_text, "
         "ai_classification, manual, or unknown. Emotions must come from the allowed list.\n\n"
@@ -1016,7 +1097,12 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
         ]
         prompt = (
             "Analyze Hebrew/English social media comments for Greenpeace Israel. "
-            "Return only the JSON requested by the schema. Use the closed lists exactly. "
+            "Return only valid JSON in this exact shape: "
+            '{"comments":[{"comment_id":"...","comment_emotions":["Neutral"],"emotion_confidence":0.0,'
+            '"comment_stance":"supportive|opposed|skeptical|neutral|unclear",'
+            '"comment_intent":"support|criticism|question|mockery|information_request|personal_story|tag_friend|political_attack|spam|other",'
+            '"is_sarcastic":false,"requires_response":false,"response_priority":"none|low|medium|high"}]}. '
+            "Use the closed lists exactly. "
             "requires_response should be true for good-faith questions, information requests, serious criticism, "
             "or safety/reputation issues. Use high priority only when immediate organizational response is important.\n\n"
             f"Comments:\n{json.dumps(items, ensure_ascii=False)}"
@@ -1100,7 +1186,11 @@ def sync() -> None:
     service = get_sheets_service()
     ensure_schema(service, spreadsheet_id)
 
-    posts, comments = collect_rows()
+    known_post_ids = existing_ids(service, spreadsheet_id, "Posts", POST_HEADERS, "post_id")
+    known_comment_ids = existing_ids(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS, "comment_id")
+    print(f"Found {len(known_post_ids)} existing posts and {len(known_comment_ids)} existing comments in Google Sheets.")
+
+    posts, comments = collect_rows(known_post_ids, known_comment_ids)
     if env_bool("ANALYZE_WITH_GEMINI", True):
         analyze_posts(posts)
         analyze_comments(comments, posts)
