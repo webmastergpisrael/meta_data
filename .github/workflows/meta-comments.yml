@@ -58,7 +58,7 @@ jobs:
           MAX_REPLIES_PER_COMMENT: ${{ github.event.inputs.max_replies_per_comment || vars.MAX_REPLIES_PER_COMMENT || '2' }}
           COMMENT_LOOKBACK_DAYS: ${{ vars.COMMENT_LOOKBACK_DAYS || '7' }}
           POST_LOOKBACK_DAYS: ${{ vars.POST_LOOKBACK_DAYS || '14' }}
-          GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '20' }}
+          GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '1' }}
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
           GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '0' }}
           GEMINI_RETRY_BASE_SECONDS: ${{ vars.GEMINI_RETRY_BASE_SECONDS || '15' }}
