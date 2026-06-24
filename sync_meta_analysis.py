@@ -134,7 +134,7 @@ CONFIG = {
     "max_ads": env_int("MAX_ADS", 0),
     "max_comments_per_post": env_int("MAX_COMMENTS_PER_POST", 5),
     "max_replies_per_comment": env_int("MAX_REPLIES_PER_COMMENT", 2),
-    "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 20),
+    "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 1),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 0),
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 15),
@@ -894,12 +894,6 @@ def make_post_row(
 
 def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     api_key = required_env("GEMINI_API_KEY")
-    print(
-        "Gemini request: "
-        f"mode={CONFIG['gemini_api_mode']}, "
-        f"model={CONFIG['gemini_model']}, "
-        f"prompt_chars={len(prompt)}"
-    )
     result = gemini_generate_json_with_mode(prompt, api_key, CONFIG["gemini_api_mode"])
     if result is not None:
         return result
@@ -915,6 +909,12 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
 
 def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict[str, Any] | None:
     url, payload, headers = gemini_request(prompt, api_key, mode)
+    print(
+        "Gemini request: "
+        f"mode={mode}, "
+        f"model={CONFIG['gemini_model']}, "
+        f"prompt_chars={len(prompt)}"
+    )
     retryable_statuses = {429, 500, 502, 503, 504}
     max_retries = max(0, CONFIG["gemini_max_retries"])
 
@@ -983,6 +983,13 @@ def extract_gemini_json(data: dict[str, Any]) -> dict[str, Any]:
             for content in output.get("content", []):
                 if content.get("type") == "text" and content.get("text"):
                     text += content["text"]
+    elif data.get("steps"):
+        for step in data.get("steps", []):
+            if not isinstance(step, dict):
+                continue
+            for content in step.get("content", []):
+                if isinstance(content, dict) and content.get("type") == "text" and content.get("text"):
+                    text += content["text"]
 
     text = text.strip()
     if text.startswith("```"):
@@ -1005,6 +1012,12 @@ def gemini_response_shape(data: dict[str, Any]) -> str:
             output.get("type", type(output).__name__)
             for output in data["output"][:5]
             if isinstance(output, dict)
+        ]
+    if data.get("steps") and isinstance(data["steps"], list):
+        shape["step_types"] = [
+            step.get("type", type(step).__name__)
+            for step in data["steps"][:5]
+            if isinstance(step, dict)
         ]
     if data.get("candidates") and isinstance(data["candidates"], list):
         shape["candidates_count"] = len(data["candidates"])
