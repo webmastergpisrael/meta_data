@@ -30,7 +30,7 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables` if you 
 - `POST_LOOKBACK_DAYS` - default: `14`.
 - `GEMINI_BATCH_SIZE` - default: `20`.
 - `ANALYSIS_TEXT_CHARS` - default: `1200`.
-- `GEMINI_MAX_RETRIES` - default: `4`.
+- `GEMINI_MAX_RETRIES` - default: `0`.
 - `GEMINI_RETRY_BASE_SECONDS` - default: `15`.
 - `GEMINI_FALLBACK_ON_ERROR` - default: `true`; keeps the sync running with default analysis values if Gemini is temporarily unavailable.
 
