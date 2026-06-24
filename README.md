@@ -22,7 +22,7 @@ Do not commit tokens or API keys into this repository. If a token was pasted int
 Add these in `Settings -> Secrets and variables -> Actions -> Variables` if you want to override the defaults:
 
 - `GEMINI_MODEL` - default: `gemini-2.5-flash-lite`.
-- `GEMINI_API_MODE` - default: `interactions`; use `generateContent` only if needed.
+- `GEMINI_API_MODE` - default: `generateContent`.
 - `META_GRAPH_VERSION` - default: `v23.0`.
 - `MAX_FACEBOOK_POSTS` - default: `1`.
 - `MAX_INSTAGRAM_MEDIA` - default: `1`.
