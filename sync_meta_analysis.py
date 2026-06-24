@@ -140,7 +140,7 @@ CONFIG = {
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 15),
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", True),
     "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash-lite"),
-    "gemini_api_mode": env_value("GEMINI_API_MODE", "interactions"),
+    "gemini_api_mode": env_value("GEMINI_API_MODE", "generateContent"),
     "gemini_fallback_after_quota_error": env_bool("GEMINI_FALLBACK_AFTER_QUOTA_ERROR", False),
     "gemini_quota_exhausted": False,
     "gemini_quota_notice_printed": False,
