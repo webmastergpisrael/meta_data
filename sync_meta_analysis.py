@@ -895,6 +895,12 @@ def make_post_row(
 def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
     api_key = required_env("GEMINI_API_KEY")
     url, payload, headers = gemini_request(prompt, api_key)
+    print(
+        "Gemini request: "
+        f"mode={CONFIG['gemini_api_mode']}, "
+        f"model={CONFIG['gemini_model']}, "
+        f"prompt_chars={len(prompt)}"
+    )
     retryable_statuses = {429, 500, 502, 503, 504}
     max_retries = max(0, CONFIG["gemini_max_retries"])
 
