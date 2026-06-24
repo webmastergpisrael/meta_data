@@ -1,68 +1,42 @@
-name: Meta data sync
+# Meta Data Sync
 
-on:
-  workflow_dispatch:
-    inputs:
-      max_facebook_posts:
-        description: "How many Facebook posts to fetch"
-        required: false
-        default: "1"
-      max_instagram_media:
-        description: "How many Instagram media items to fetch"
-        required: false
-        default: "1"
-      max_ads:
-        description: "How many paid ads to fetch"
-        required: false
-        default: "0"
-      max_comments_per_post:
-        description: "How many top-level comments per post/media/ad"
-        required: false
-        default: "5"
-      max_replies_per_comment:
-        description: "How many replies per top-level comment"
-        required: false
-        default: "2"
-  schedule:
-    - cron: "0 3 * * *"
+GitHub Actions workflow that fetches a small sample of Facebook/Instagram posts and comments from Meta, analyzes the text with Gemini, and writes the results to Google Sheets.
 
-jobs:
-  sync:
-    runs-on: ubuntu-latest
+Each run reads existing `post_id` and `comment_id` values from Google Sheets first. Existing posts are skipped, so their comments are not fetched or analyzed again.
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+## Required GitHub Secrets
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+Add these in `Settings -> Secrets and variables -> Actions -> New repository secret`:
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+- `GOOGLE_SERVICE_ACCOUNT_JSON` - full Google service account JSON with Google Sheets API access.
+- `SPREADSHEET_ID` - the Google Sheets document ID.
+- `META_ACCESS_TOKEN` - the single Meta access token used for all Meta Graph API reads. The script auto-discovers the Facebook Page, connected Instagram business account, and ad account when ads are enabled.
+- `GEMINI_API_KEY` - Gemini API key, not a model ID or project ID.
 
-      - name: Sync Meta data to Google Sheets
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash-lite' }}
-          GEMINI_API_MODE: ${{ vars.GEMINI_API_MODE || 'interactions' }}
-          MAX_FACEBOOK_POSTS: ${{ github.event.inputs.max_facebook_posts || vars.MAX_FACEBOOK_POSTS || '1' }}
-          MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
-          MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '0' }}
-          MAX_COMMENTS_PER_POST: ${{ github.event.inputs.max_comments_per_post || vars.MAX_COMMENTS_PER_POST || '5' }}
-          MAX_REPLIES_PER_COMMENT: ${{ github.event.inputs.max_replies_per_comment || vars.MAX_REPLIES_PER_COMMENT || '2' }}
-          COMMENT_LOOKBACK_DAYS: ${{ vars.COMMENT_LOOKBACK_DAYS || '7' }}
-          POST_LOOKBACK_DAYS: ${{ vars.POST_LOOKBACK_DAYS || '14' }}
-          GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '20' }}
-          ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
-          GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '0' }}
-          GEMINI_RETRY_BASE_SECONDS: ${{ vars.GEMINI_RETRY_BASE_SECONDS || '15' }}
-          GEMINI_FALLBACK_ON_ERROR: ${{ vars.GEMINI_FALLBACK_ON_ERROR || 'true' }}
-          ANALYZE_WITH_GEMINI: "true"
-          TIMEZONE: Asia/Jerusalem
-        run: python sync_meta_analysis.py
+Share the Google Sheet with the `client_email` from the service account JSON as an editor.
+
+Do not commit tokens or API keys into this repository. If a token was pasted into chat, browser history, or a public place, rotate it before using the workflow.
+
+## Optional GitHub Variables
+
+Add these in `Settings -> Secrets and variables -> Actions -> Variables` if you want to override the defaults:
+
+- `GEMINI_MODEL` - default: `gemini-2.5-flash-lite`.
+- `GEMINI_API_MODE` - default: `interactions`; use `generateContent` only if needed.
+- `META_GRAPH_VERSION` - default: `v23.0`.
+- `MAX_FACEBOOK_POSTS` - default: `1`.
+- `MAX_INSTAGRAM_MEDIA` - default: `1`.
+- `MAX_ADS` - default: `0`.
+- `MAX_COMMENTS_PER_POST` - default: `5`.
+- `MAX_REPLIES_PER_COMMENT` - default: `2`.
+- `COMMENT_LOOKBACK_DAYS` - default: `7`.
+- `POST_LOOKBACK_DAYS` - default: `14`.
+- `GEMINI_BATCH_SIZE` - default: `20`.
+- `ANALYSIS_TEXT_CHARS` - default: `1200`.
+- `GEMINI_MAX_RETRIES` - default: `0`.
+- `GEMINI_RETRY_BASE_SECONDS` - default: `15`.
+- `GEMINI_FALLBACK_ON_ERROR` - default: `true`; keeps the sync running with default analysis values if Gemini is temporarily unavailable.
+
+## First Run
+
+Run the `Meta data sync` workflow manually from the Actions tab with the defaults first. It starts with a tiny sample to avoid wasting Gemini tokens.
