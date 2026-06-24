@@ -62,7 +62,7 @@ jobs:
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
           GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '0' }}
           GEMINI_RETRY_BASE_SECONDS: ${{ vars.GEMINI_RETRY_BASE_SECONDS || '15' }}
-          GEMINI_FALLBACK_ON_ERROR: ${{ vars.GEMINI_FALLBACK_ON_ERROR || 'true' }}
+          GEMINI_FALLBACK_ON_ERROR: ${{ vars.GEMINI_FALLBACK_ON_ERROR || 'false' }}
           GEMINI_FALLBACK_AFTER_QUOTA_ERROR: ${{ vars.GEMINI_FALLBACK_AFTER_QUOTA_ERROR || 'false' }}
           ANALYZE_WITH_GEMINI: "true"
           TIMEZONE: Asia/Jerusalem
