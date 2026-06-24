@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -135,6 +136,9 @@ CONFIG = {
     "max_replies_per_comment": env_int("MAX_REPLIES_PER_COMMENT", 2),
     "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 20),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
+    "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 4),
+    "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 15),
+    "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", True),
     "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash"),
     "greenpeace_facebook_page_id": "",
     "greenpeace_instagram_username": "",
@@ -865,16 +869,43 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
             "responseSchema": schema,
         },
     }
-    response = requests.post(url, json=payload, timeout=120)
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"Gemini returned non-JSON response: {response.text[:500]}") from exc
-    if not response.ok:
-        raise RuntimeError(f"Gemini API error {response.status_code}: {json.dumps(data, ensure_ascii=False)[:1000]}")
+    retryable_statuses = {429, 500, 502, 503, 504}
+    max_retries = max(0, CONFIG["gemini_max_retries"])
 
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=120)
+            data = response.json() if response.text else {}
+        except (requests.RequestException, ValueError) as exc:
+            if attempt >= max_retries:
+                return gemini_fallback_or_raise(f"Gemini request failed: {exc}")
+            sleep_before_gemini_retry(attempt)
+            continue
+
+        if response.ok:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text)
+
+        message = json.dumps(data, ensure_ascii=False)[:1000]
+        if response.status_code not in retryable_statuses or attempt >= max_retries:
+            return gemini_fallback_or_raise(f"Gemini API error {response.status_code}: {message}")
+        sleep_before_gemini_retry(attempt)
+
+    return gemini_fallback_or_raise("Gemini API failed after retries.")
+
+
+def sleep_before_gemini_retry(attempt: int) -> None:
+    delay = CONFIG["gemini_retry_base_seconds"] * (2 ** attempt)
+    print(f"Gemini is temporarily unavailable. Retrying in {delay} seconds...")
+    time.sleep(delay)
+
+
+def gemini_fallback_or_raise(message: str) -> dict[str, Any]:
+    if CONFIG["gemini_fallback_on_error"]:
+        print(f"WARNING: {message}")
+        print("Continuing without Gemini analysis for this batch; default analysis values will be used.")
+        return {}
+    raise RuntimeError(message)
 
 
 def analyze_posts(posts: list[dict[str, Any]]) -> None:
