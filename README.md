@@ -31,11 +31,12 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables` if you 
 - `MAX_REPLIES_PER_COMMENT` - default: `2`.
 - `COMMENT_LOOKBACK_DAYS` - default: `7`.
 - `POST_LOOKBACK_DAYS` - default: `14`.
-- `GEMINI_BATCH_SIZE` - default: `20`.
+- `GEMINI_BATCH_SIZE` - default: `1`.
 - `ANALYSIS_TEXT_CHARS` - default: `1200`.
 - `GEMINI_MAX_RETRIES` - default: `0`.
 - `GEMINI_RETRY_BASE_SECONDS` - default: `15`.
 - `GEMINI_FALLBACK_ON_ERROR` - default: `true`; keeps the sync running with default analysis values if Gemini is temporarily unavailable.
+- `GEMINI_FALLBACK_AFTER_QUOTA_ERROR` - default: `false`; avoids spending another request after Gemini returns quota/rate-limit errors.
 
 ## First Run
 
