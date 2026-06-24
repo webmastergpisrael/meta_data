@@ -49,7 +49,7 @@ jobs:
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash-lite' }}
           MAX_FACEBOOK_POSTS: ${{ github.event.inputs.max_facebook_posts || vars.MAX_FACEBOOK_POSTS || '1' }}
           MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
           MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '0' }}
@@ -59,7 +59,7 @@ jobs:
           POST_LOOKBACK_DAYS: ${{ vars.POST_LOOKBACK_DAYS || '14' }}
           GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '20' }}
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
-          GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '4' }}
+          GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '0' }}
           GEMINI_RETRY_BASE_SECONDS: ${{ vars.GEMINI_RETRY_BASE_SECONDS || '15' }}
           GEMINI_FALLBACK_ON_ERROR: ${{ vars.GEMINI_FALLBACK_ON_ERROR || 'true' }}
           ANALYZE_WITH_GEMINI: "true"
