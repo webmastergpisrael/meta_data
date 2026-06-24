@@ -59,6 +59,9 @@ jobs:
           POST_LOOKBACK_DAYS: ${{ vars.POST_LOOKBACK_DAYS || '14' }}
           GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '20' }}
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
+          GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '4' }}
+          GEMINI_RETRY_BASE_SECONDS: ${{ vars.GEMINI_RETRY_BASE_SECONDS || '15' }}
+          GEMINI_FALLBACK_ON_ERROR: ${{ vars.GEMINI_FALLBACK_ON_ERROR || 'true' }}
           ANALYZE_WITH_GEMINI: "true"
           TIMEZONE: Asia/Jerusalem
         run: python sync_meta_analysis.py
