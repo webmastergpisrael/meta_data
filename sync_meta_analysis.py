@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from google.oauth2 import service_account
@@ -127,13 +128,15 @@ CONFIG = {
     "ig_user_id": "",
     "ad_account_id": "",
     "graph_version": env_value("META_GRAPH_VERSION", "v23.0"),
-    "post_lookback_days": env_int("POST_LOOKBACK_DAYS", 14),
-    "comment_lookback_days": env_int("COMMENT_LOOKBACK_DAYS", 7),
+    "start_date": env_value("START_DATE"),
+    "end_date": env_value("END_DATE"),
+    "timezone": env_value("TIMEZONE", "UTC"),
     "max_facebook_posts": env_int("MAX_FACEBOOK_POSTS", 1),
     "max_instagram_media": env_int("MAX_INSTAGRAM_MEDIA", 1),
-    "max_ads": env_int("MAX_ADS", 0),
+    "max_paid_posts": env_int("MAX_PAID_POSTS", 0),
+    "max_ads": env_int("MAX_ADS", 10),
+    "max_comments": env_int("MAX_COMMENTS", 10),
     "max_comments_per_post": env_int("MAX_COMMENTS_PER_POST", 5),
-    "max_replies_per_comment": env_int("MAX_REPLIES_PER_COMMENT", 2),
     "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 1),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 0),
@@ -406,6 +409,40 @@ def is_within(date_value: str, since_date: datetime, until_date: datetime) -> bo
     return bool(parsed and since_date <= parsed <= until_date)
 
 
+def configured_timezone():
+    try:
+        return ZoneInfo(CONFIG["timezone"])
+    except ZoneInfoNotFoundError:
+        return timezone.utc
+
+
+def parse_window_date(value: str, is_end: bool, local_tz) -> datetime | None:
+    value = clean_text(value)
+    if not value:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+        if is_end:
+            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return parsed.replace(tzinfo=local_tz).astimezone(timezone.utc)
+
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if not parsed.tzinfo:
+        parsed = parsed.replace(tzinfo=local_tz)
+    return parsed.astimezone(timezone.utc)
+
+
+def collection_window() -> tuple[datetime, datetime]:
+    local_tz = configured_timezone()
+    now = datetime.now(timezone.utc)
+    end_date = parse_window_date(CONFIG["end_date"], True, local_tz) or now
+    start_date = parse_window_date(CONFIG["start_date"], False, local_tz) or (end_date - timedelta(days=7))
+    if start_date > end_date:
+        raise RuntimeError("START_DATE must be before or equal to END_DATE.")
+    return start_date, end_date
+
+
 def clean_text(value: Any) -> str:
     return re.sub(r"[\r\n\t]+", " ", str(value or "")).strip()
 
@@ -478,7 +515,7 @@ def discover_meta_context(access_token: str) -> dict[str, str]:
             context["ig_user_id"] = context["ig_user_id"] or str(instagram.get("id") or "")
             context["instagram_username"] = context["instagram_username"] or str(instagram.get("username") or "")
 
-    if not context["ad_account_id"] and CONFIG["max_ads"] > 0:
+    if not context["ad_account_id"] and CONFIG["max_ads"] > 0 and CONFIG["max_paid_posts"] > 0:
         ad_accounts = fetch_json(
             graph_url(
                 "/me/adaccounts",
@@ -524,7 +561,7 @@ def fetch_facebook_posts(page_id: str, post_since: datetime, until: datetime, co
     )
 
 
-def fetch_instagram_media(ig_user_id: str, access_token: str):
+def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: datetime, access_token: str):
     if not ig_user_id or CONFIG["max_instagram_media"] <= 0:
         return []
     fields = ",".join(
@@ -538,16 +575,25 @@ def fetch_instagram_media(ig_user_id: str, access_token: str):
             "comments_count",
         ]
     )
-    return get_all_pages(
+    media = get_all_pages(
         f"/{ig_user_id}/media",
-        {"fields": fields, "limit": CONFIG["max_instagram_media"]},
+        {"fields": fields, "since": to_unix(since_date), "until": to_unix(until_date), "limit": CONFIG["max_instagram_media"]},
         access_token,
         CONFIG["max_instagram_media"],
     )
+    return [item for item in media if is_within(item.get("timestamp", ""), since_date, until_date)]
 
 
-def fetch_facebook_comments_with_replies(object_id: str, since_date: datetime, until_date: datetime, access_token: str):
-    replies = f"comments.limit({CONFIG['max_replies_per_comment']}){{{FACEBOOK_COMMENT_FIELDS}}}"
+def fetch_facebook_comments_with_replies(
+    object_id: str,
+    since_date: datetime,
+    until_date: datetime,
+    access_token: str,
+    max_comments: int,
+):
+    if max_comments <= 0:
+        return []
+    replies = f"comments.limit({max_comments}){{{FACEBOOK_COMMENT_FIELDS}}}"
     fields = f"{FACEBOOK_COMMENT_FIELDS},{replies}"
     comments = get_all_pages(
         f"/{object_id}/comments",
@@ -557,32 +603,43 @@ def fetch_facebook_comments_with_replies(object_id: str, since_date: datetime, u
             "order": "chronological",
             "since": to_unix(since_date),
             "until": to_unix(until_date),
-            "limit": CONFIG["max_comments_per_post"],
+            "limit": max_comments,
         },
         access_token,
-        CONFIG["max_comments_per_post"],
+        max_comments,
     )
     return [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
 
 
-def fetch_instagram_comments(media_id: str, since_date: datetime, until_date: datetime, access_token: str):
-    replies = f"replies.limit({CONFIG['max_replies_per_comment']}){{id,text,timestamp,username,like_count}}"
+def fetch_instagram_comments(
+    media_id: str,
+    since_date: datetime,
+    until_date: datetime,
+    access_token: str,
+    max_comments: int,
+):
+    if max_comments <= 0:
+        return []
+    replies = f"replies.limit({max_comments}){{id,text,timestamp,username,like_count}}"
     fields = f"id,text,timestamp,username,like_count,{replies}"
     comments = get_all_pages(
         f"/{media_id}/comments",
-        {"fields": fields, "limit": CONFIG["max_comments_per_post"]},
+        {"fields": fields, "limit": max_comments},
         access_token,
-        CONFIG["max_comments_per_post"],
+        max_comments,
     )
     return [comment for comment in comments if is_within(comment.get("timestamp", ""), since_date, until_date)]
 
 
 def fetch_ads(ad_account_id: str, access_token: str):
-    if not ad_account_id or CONFIG["max_ads"] <= 0:
+    if not ad_account_id or CONFIG["max_ads"] <= 0 or CONFIG["max_paid_posts"] <= 0:
         return []
     return get_all_pages(
         f"/{ad_account_id}/ads",
-        {"fields": "id,name,campaign{name},creative{id,effective_object_story_id,effective_instagram_media_id}", "limit": CONFIG["max_ads"]},
+        {
+            "fields": "id,name,campaign{name},creative{id,effective_object_story_id,effective_instagram_media_id}",
+            "limit": CONFIG["max_ads"],
+        },
         access_token,
         CONFIG["max_ads"],
     )
@@ -600,7 +657,15 @@ def fetch_facebook_object(object_id: str, access_token: str):
     )
 
 
-def fetch_facebook_comments(object_id: str, since_date: datetime, until_date: datetime, access_token: str):
+def fetch_facebook_comments(
+    object_id: str,
+    since_date: datetime,
+    until_date: datetime,
+    access_token: str,
+    max_comments: int,
+):
+    if max_comments <= 0:
+        return []
     comments = get_all_pages(
         f"/{object_id}/comments",
         {
@@ -609,21 +674,31 @@ def fetch_facebook_comments(object_id: str, since_date: datetime, until_date: da
             "order": "chronological",
             "since": to_unix(since_date),
             "until": to_unix(until_date),
-            "limit": CONFIG["max_comments_per_post"],
+            "limit": max_comments,
         },
         access_token,
-        CONFIG["max_comments_per_post"],
+        max_comments,
     )
     return [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
 
 
-def fetch_instagram_media_by_id(media_id: str, access_token: str):
+def fetch_instagram_media_by_id(media_id: str, access_token: str, max_comments: int):
+    if max_comments <= 0:
+        return fetch_json(
+            graph_url(
+                f"/{media_id}",
+                {
+                    "fields": "id,caption,timestamp,permalink,media_type,like_count,comments_count"
+                },
+                access_token,
+            )
+        )
     replies = (
-        f"replies.limit({CONFIG['max_replies_per_comment']})"
+        f"replies.limit({max_comments})"
         "{id,text,timestamp,username,like_count}"
     )
     comments = (
-        f"comments.limit({CONFIG['max_comments_per_post']})"
+        f"comments.limit({max_comments})"
         f"{{id,text,timestamp,username,like_count,{replies}}}"
     )
     return fetch_json(
@@ -722,6 +797,49 @@ def add_comment(
     )
 
 
+def collect_visible_comments(
+    comments: list[dict[str, Any]],
+    seen: set[str],
+    platform: str,
+    post_id: str,
+    raw_comments: list[dict[str, Any]],
+    post_url: str,
+    since_date: datetime,
+    until_date: datetime,
+    max_comments: int,
+) -> None:
+    collected = 0
+    date_field = "created_time" if platform == "facebook" else "timestamp"
+    replies_field = "comments" if platform == "facebook" else "replies"
+
+    for comment in raw_comments:
+        if collected >= max_comments:
+            break
+        if is_within(comment.get(date_field, ""), since_date, until_date):
+            before_count = len(comments)
+            add_comment(comments, seen, platform, post_id, comment, "", post_url)
+            if len(comments) > before_count:
+                collected += 1
+
+        for reply in (comment.get(replies_field, {}).get("data") or []):
+            if collected >= max_comments:
+                break
+            if not is_within(reply.get(date_field, ""), since_date, until_date):
+                continue
+            before_count = len(comments)
+            add_comment(comments, seen, platform, post_id, reply, comment.get("id", ""), post_url)
+            if len(comments) > before_count:
+                collected += 1
+
+
+def remaining_comment_limit(comments: list[dict[str, Any]]) -> int:
+    return max(CONFIG["max_comments"] - len(comments), 0)
+
+
+def per_post_comment_limit(comments: list[dict[str, Any]]) -> int:
+    return min(CONFIG["max_comments_per_post"], remaining_comment_limit(comments))
+
+
 def collect_rows(
     existing_post_ids: set[str] | None = None,
     existing_comment_ids: set[str] | None = None,
@@ -729,9 +847,7 @@ def collect_rows(
     existing_post_ids = existing_post_ids or set()
     existing_comment_ids = existing_comment_ids or set()
     access_token = meta_access_token()
-    now = datetime.now(timezone.utc)
-    post_since = now - timedelta(days=CONFIG["post_lookback_days"])
-    comment_since = now - timedelta(days=CONFIG["comment_lookback_days"])
+    window_start, window_end = collection_window()
     meta_context = discover_meta_context(access_token)
     page_token = meta_context["page_access_token"]
 
@@ -739,16 +855,25 @@ def collect_rows(
     comments: list[dict[str, Any]] = []
     seen_comments: set[str] = set(existing_comment_ids)
 
-    for post in fetch_facebook_posts(meta_context["page_id"], post_since, now, comment_since, page_token):
+    for post in fetch_facebook_posts(meta_context["page_id"], window_start, window_end, window_start, page_token):
         post_id = post.get("id", "")
         if not post_id or post_id in existing_post_ids:
             continue
 
-        post_comments = fetch_facebook_comments_with_replies(post_id, comment_since, now, page_token)
-        for comment in post_comments:
-            add_comment(comments, seen_comments, "facebook", post_id, comment, "", post.get("permalink_url", ""))
-            for reply in comment.get("comments", {}).get("data", []):
-                add_comment(comments, seen_comments, "facebook", post_id, reply, comment.get("id", ""), post.get("permalink_url", ""))
+        comment_limit = per_post_comment_limit(comments)
+        if comment_limit > 0:
+            post_comments = fetch_facebook_comments_with_replies(post_id, window_start, window_end, page_token, comment_limit)
+            collect_visible_comments(
+                comments,
+                seen_comments,
+                "facebook",
+                post_id,
+                post_comments,
+                post.get("permalink_url", ""),
+                window_start,
+                window_end,
+                comment_limit,
+            )
 
         posts.append(
             make_post_row(
@@ -762,23 +887,31 @@ def collect_rows(
                 ad_id="",
                 media_type=media_type_from_facebook(post),
                 like_count=first_summary_total(post, "reactions") or first_summary_total(post, "likes"),
-                collected_window_start=comment_since,
-                collected_window_end=now,
+                collected_window_start=window_start,
+                collected_window_end=window_end,
                 comments=[comment for comment in comments if comment["post_id"] == post_id],
             )
         )
 
-    for media in fetch_instagram_media(meta_context["ig_user_id"], access_token):
+    for media in fetch_instagram_media(meta_context["ig_user_id"], window_start, window_end, access_token):
         post_id = media.get("id", "")
         if not post_id or post_id in existing_post_ids:
             continue
 
-        post_comments = fetch_instagram_comments(post_id, comment_since, now, access_token)
-        for comment in post_comments:
-            add_comment(comments, seen_comments, "instagram", post_id, comment, "", media.get("permalink", ""))
-            for reply in comment.get("replies", {}).get("data", []):
-                if is_within(reply.get("timestamp", ""), comment_since, now):
-                    add_comment(comments, seen_comments, "instagram", post_id, reply, comment.get("id", ""), media.get("permalink", ""))
+        comment_limit = per_post_comment_limit(comments)
+        if comment_limit > 0:
+            post_comments = fetch_instagram_comments(post_id, window_start, window_end, access_token, comment_limit)
+            collect_visible_comments(
+                comments,
+                seen_comments,
+                "instagram",
+                post_id,
+                post_comments,
+                media.get("permalink", ""),
+                window_start,
+                window_end,
+                comment_limit,
+            )
 
         posts.append(
             make_post_row(
@@ -792,13 +925,16 @@ def collect_rows(
                 ad_id="",
                 media_type=media_type_from_instagram(media),
                 like_count=media.get("like_count", 0),
-                collected_window_start=comment_since,
-                collected_window_end=now,
+                collected_window_start=window_start,
+                collected_window_end=window_end,
                 comments=[comment for comment in comments if comment["post_id"] == post_id],
             )
         )
 
+    paid_posts = 0
     for ad in fetch_ads(meta_context["ad_account_id"], access_token):
+        if paid_posts >= CONFIG["max_paid_posts"]:
+            break
         creative = ad.get("creative", {})
         campaign_name = ad.get("campaign", {}).get("name", "")
         ad_id = ad.get("id", "")
@@ -806,50 +942,83 @@ def collect_rows(
             object_id = creative["effective_object_story_id"]
             if object_id not in existing_post_ids:
                 ad_post = fetch_facebook_object(object_id, page_token)
-                ad_comments = fetch_facebook_comments(object_id, comment_since, now, page_token)
-                for comment in ad_comments:
-                    add_comment(comments, seen_comments, "facebook", object_id, comment, "", ad_post.get("permalink_url", ""))
-                posts.append(
-                    make_post_row(
-                        post_id=object_id,
-                        platform="facebook",
-                        created_time=ad_post.get("created_time", ""),
-                        message=ad_post.get("message", ""),
-                        url=ad_post.get("permalink_url", ""),
-                        source_type="paid",
-                        campaign_name=campaign_name,
-                        ad_id=ad_id,
-                        media_type=media_type_from_facebook(ad_post),
-                        like_count=first_summary_total(ad_post, "reactions") or first_summary_total(ad_post, "likes"),
-                        collected_window_start=comment_since,
-                        collected_window_end=now,
-                        comments=[comment for comment in comments if comment["post_id"] == object_id],
+                if is_within(ad_post.get("created_time", ""), window_start, window_end):
+                    comment_limit = per_post_comment_limit(comments)
+                    if comment_limit > 0:
+                        ad_comments = fetch_facebook_comments_with_replies(
+                            object_id,
+                            window_start,
+                            window_end,
+                            page_token,
+                            comment_limit,
+                        )
+                        collect_visible_comments(
+                            comments,
+                            seen_comments,
+                            "facebook",
+                            object_id,
+                            ad_comments,
+                            ad_post.get("permalink_url", ""),
+                            window_start,
+                            window_end,
+                            comment_limit,
+                        )
+                    posts.append(
+                        make_post_row(
+                            post_id=object_id,
+                            platform="facebook",
+                            created_time=ad_post.get("created_time", ""),
+                            message=ad_post.get("message", ""),
+                            url=ad_post.get("permalink_url", ""),
+                            source_type="paid",
+                            campaign_name=campaign_name,
+                            ad_id=ad_id,
+                            media_type=media_type_from_facebook(ad_post),
+                            like_count=first_summary_total(ad_post, "reactions") or first_summary_total(ad_post, "likes"),
+                            collected_window_start=window_start,
+                            collected_window_end=window_end,
+                            comments=[comment for comment in comments if comment["post_id"] == object_id],
+                        )
                     )
-                )
+                    paid_posts += 1
+        if paid_posts >= CONFIG["max_paid_posts"]:
+            break
         if creative.get("effective_instagram_media_id"):
             media_id = creative["effective_instagram_media_id"]
             if media_id not in existing_post_ids:
-                ad_media = fetch_instagram_media_by_id(media_id, access_token)
-                for comment in ad_media.get("comments", {}).get("data", []):
-                    if is_within(comment.get("timestamp", ""), comment_since, now):
-                        add_comment(comments, seen_comments, "instagram", media_id, comment, "", ad_media.get("permalink", ""))
-                posts.append(
-                    make_post_row(
-                        post_id=media_id,
-                        platform="instagram",
-                        created_time=ad_media.get("timestamp", ""),
-                        message=ad_media.get("caption", ""),
-                        url=ad_media.get("permalink", ""),
-                        source_type="paid",
-                        campaign_name=campaign_name,
-                        ad_id=ad_id,
-                        media_type=media_type_from_instagram(ad_media),
-                        like_count=ad_media.get("like_count", 0),
-                        collected_window_start=comment_since,
-                        collected_window_end=now,
-                        comments=[comment for comment in comments if comment["post_id"] == media_id],
+                comment_limit = per_post_comment_limit(comments)
+                ad_media = fetch_instagram_media_by_id(media_id, access_token, comment_limit)
+                if is_within(ad_media.get("timestamp", ""), window_start, window_end):
+                    if comment_limit > 0:
+                        collect_visible_comments(
+                            comments,
+                            seen_comments,
+                            "instagram",
+                            media_id,
+                            ad_media.get("comments", {}).get("data", []),
+                            ad_media.get("permalink", ""),
+                            window_start,
+                            window_end,
+                            comment_limit,
+                        )
+                    posts.append(
+                        make_post_row(
+                            post_id=media_id,
+                            platform="instagram",
+                            created_time=ad_media.get("timestamp", ""),
+                            message=ad_media.get("caption", ""),
+                            url=ad_media.get("permalink", ""),
+                            source_type="paid",
+                            campaign_name=campaign_name,
+                            ad_id=ad_id,
+                            media_type=media_type_from_instagram(ad_media),
+                            like_count=ad_media.get("like_count", 0),
+                            collected_window_start=window_start,
+                            collected_window_end=window_end,
+                            comments=[comment for comment in comments if comment["post_id"] == media_id],
+                        )
                     )
-                )
+                    paid_posts += 1
 
     return posts, comments
 
