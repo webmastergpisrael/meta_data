@@ -58,6 +58,9 @@ COMMENT_HEADERS = [
     "is_sarcastic",
     "requires_response",
     "response_priority",
+    "is_brand_comment",
+    "comment_sentiment",
+    "comment_tone",
 ]
 
 SUMMARY_HEADERS = [
@@ -90,8 +93,39 @@ FACEBOOK_COMMENT_FIELDS = ",".join(
 )
 
 POST_EMOTIONS = ["Awe", "Urgency", "Anger", "Grief", "Hope", "Sarcasm", "Amusement", "Neutral"]
-COMMENT_EMOTIONS = ["Admiration", "Sadness", "Skepticism", "Anger", "Sarcasm", "Anxiety", "Amusement", "Neutral"]
+COMMENT_EMOTIONS = [
+    "Admiration",
+    "Sadness",
+    "Skepticism",
+    "Anger",
+    "Sarcasm",
+    "Anxiety",
+    "Amusement",
+    "Contempt",
+    "Disgust",
+    "Hostility",
+    "Dismissiveness",
+    "Confusion",
+    "Concern",
+    "Agreement",
+    "Neutral",
+]
 TOPIC_SOURCES = ["hashtags", "campaign_name", "ad_text", "ai_classification", "manual", "unknown"]
+COMMENT_SENTIMENTS = ["positive", "negative", "mixed", "neutral", "unclear"]
+COMMENT_TONES = [
+    "hostile",
+    "sarcastic",
+    "worried",
+    "supportive",
+    "curious",
+    "dismissive",
+    "informational",
+    "humorous",
+    "grieving",
+    "angry",
+    "neutral",
+    "unclear",
+]
 COMMENT_STANCES = ["supportive", "opposed", "skeptical", "neutral", "unclear"]
 COMMENT_INTENTS = [
     "support",
@@ -142,7 +176,7 @@ CONFIG = {
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 0),
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 15),
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", False),
-    "gemini_model": env_value("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+    "gemini_model": env_value("GEMINI_MODEL", "gemini-3.5-flash"),
     "gemini_api_mode": env_value("GEMINI_API_MODE", "generateContent"),
     "gemini_fallback_after_quota_error": env_bool("GEMINI_FALLBACK_AFTER_QUOTA_ERROR", False),
     "gemini_quota_exhausted": False,
@@ -296,6 +330,34 @@ def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[st
         if value:
             output.add(value)
     return output
+
+
+def existing_analyzed_comment_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
+    ensure_sheet(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS)
+    mapping = header_map(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS)
+    id_column = mapping.get("comment_id")
+    if not id_column:
+        return set(), 0
+
+    required_columns = ["is_brand_comment", "comment_sentiment", "comment_tone"]
+    rows = get_values(service, spreadsheet_id, sheet_range("Post Comments", f"A2:{col_letter(len(COMMENT_HEADERS))}"))
+    analyzed_ids = set()
+    missing_analysis_count = 0
+    for row in rows:
+        padded = pad_row(row, len(COMMENT_HEADERS))
+        comment_id = str(padded[id_column - 1] or "").strip()
+        if not comment_id:
+            continue
+
+        has_new_analysis = all(
+            mapping.get(header) and str(padded[mapping[header] - 1] or "").strip()
+            for header in required_columns
+        )
+        if has_new_analysis:
+            analyzed_ids.add(comment_id)
+        else:
+            missing_analysis_count += 1
+    return analyzed_ids, missing_analysis_count
 
 
 def upsert_by_key(
@@ -773,28 +835,31 @@ def add_comment(
         comment_url = post_url
         reply_count = len(raw_comment.get("replies", {}).get("data", []))
 
-    comments.append(
-        {
-            "comment_id": comment_id,
-            "post_id": post_id,
-            "parent_comment_id": parent_comment_id or raw_comment.get("parent", {}).get("id", ""),
-            "commenter_id": commenter_id,
-            "commenter_name": commenter_name,
-            "comment_created_time": created_time,
-            "comment_message": clean_text(message),
-            "comment_url": comment_url,
-            "like_count": raw_comment.get("like_count", 0),
-            "reply_count": reply_count,
-            "collected_at": datetime.now(timezone.utc).isoformat(),
-            "comment_emotions": ["Neutral"],
-            "Emotion_Confidence": 0.0,
-            "comment_stance": "unclear",
-            "comment_intent": "other",
-            "is_sarcastic": False,
-            "requires_response": False,
-            "response_priority": "none",
-        }
-    )
+    row = {
+        "comment_id": comment_id,
+        "post_id": post_id,
+        "parent_comment_id": parent_comment_id or raw_comment.get("parent", {}).get("id", ""),
+        "commenter_id": commenter_id,
+        "commenter_name": commenter_name,
+        "comment_created_time": created_time,
+        "comment_message": clean_text(message),
+        "comment_url": comment_url,
+        "like_count": raw_comment.get("like_count", 0),
+        "reply_count": reply_count,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "is_brand_comment": False,
+        "comment_emotions": ["Neutral"],
+        "Emotion_Confidence": 0.0,
+        "comment_sentiment": "neutral",
+        "comment_tone": "neutral",
+        "comment_stance": "unclear",
+        "comment_intent": "other",
+        "is_sarcastic": False,
+        "requires_response": False,
+        "response_priority": "none",
+    }
+    row["is_brand_comment"] = is_greenpeace_comment(row, platform)
+    comments.append(row)
 
 
 def collect_visible_comments(
@@ -1304,7 +1369,16 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
 def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]) -> None:
     if not comments:
         return
-    post_context = {post["post_id"]: truncate_text(post["post_message"]) for post in posts}
+    post_context = {
+        post["post_id"]: {
+            "post_message": truncate_text(post["post_message"]),
+            "platform": post.get("platform", ""),
+            "source_type": post.get("source_type", ""),
+            "canonical_topic": post.get("canonical_topic", ""),
+            "canonical_subtopic": post.get("canonical_subtopic", ""),
+        }
+        for post in posts
+    }
     schema = {
         "type": "OBJECT",
         "properties": {
@@ -1316,6 +1390,8 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_id": {"type": "STRING"},
                         "comment_emotions": {"type": "ARRAY", "items": {"type": "STRING", "enum": COMMENT_EMOTIONS}},
                         "emotion_confidence": {"type": "NUMBER"},
+                        "comment_sentiment": {"type": "STRING", "enum": COMMENT_SENTIMENTS},
+                        "comment_tone": {"type": "STRING", "enum": COMMENT_TONES},
                         "comment_stance": {"type": "STRING", "enum": COMMENT_STANCES},
                         "comment_intent": {"type": "STRING", "enum": COMMENT_INTENTS},
                         "is_sarcastic": {"type": "BOOLEAN"},
@@ -1326,6 +1402,8 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_id",
                         "comment_emotions",
                         "emotion_confidence",
+                        "comment_sentiment",
+                        "comment_tone",
                         "comment_stance",
                         "comment_intent",
                         "is_sarcastic",
@@ -1339,32 +1417,72 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
     }
     for batch_start in range(0, len(comments), CONFIG["analysis_batch_size"]):
         batch = comments[batch_start : batch_start + CONFIG["analysis_batch_size"]]
+        for comment in batch:
+            if comment.get("is_brand_comment"):
+                comment["comment_emotions"] = ["Neutral"]
+                comment["Emotion_Confidence"] = 1.0
+                comment["comment_sentiment"] = "neutral"
+                comment["comment_tone"] = "informational"
+                comment["comment_stance"] = "neutral"
+                comment["comment_intent"] = "other"
+                comment["is_sarcastic"] = False
+                comment["requires_response"] = False
+                comment["response_priority"] = "none"
+
         items = [
             {
                 "comment_id": comment["comment_id"],
                 "post_id": comment["post_id"],
                 "post_context": post_context.get(comment["post_id"], ""),
                 "comment_message": truncate_text(comment["comment_message"]),
+                "is_brand_comment": bool(comment.get("is_brand_comment")),
             }
             for comment in batch
+            if not comment.get("is_brand_comment")
         ]
+        if not items:
+            continue
         prompt = (
             "Analyze Hebrew/English social media comments for Greenpeace Israel. "
+            "Classify audience reaction to Greenpeace content, not the emotion of the post itself. "
             "Return only valid JSON in this exact shape: "
             '{"comments":[{"comment_id":"...","comment_emotions":["Neutral"],"emotion_confidence":0.0,'
+            '"comment_sentiment":"positive|negative|mixed|neutral|unclear",'
+            '"comment_tone":"hostile|sarcastic|worried|supportive|curious|dismissive|informational|humorous|grieving|angry|neutral|unclear",'
             '"comment_stance":"supportive|opposed|skeptical|neutral|unclear",'
             '"comment_intent":"support|criticism|question|mockery|information_request|personal_story|tag_friend|political_attack|spam|other",'
             '"is_sarcastic":false,"requires_response":false,"response_priority":"none|low|medium|high"}]}. '
             "Use the closed lists exactly. "
+            "Do not classify a comment as Neutral when it contains insults, accusations, mockery, sarcasm, "
+            "conspiracy claims, hostile language, disgust, anxiety, sadness, or clear support. "
+            "Emoji-only comments must be interpreted from emoji meaning plus post context. "
+            "If comment_stance is opposed or skeptical and comment_intent is criticism or mockery, "
+            "comment_emotions should usually not be only Neutral unless the text is purely factual and calm. "
+            "Sarcastic comments should usually include Sarcasm plus another emotion such as Contempt, "
+            "Dismissiveness, Anger, Amusement, Skepticism, or Hostility. "
+            "Use Contempt/Dismissiveness for belittling or sneering comments, Hostility for personal attacks, "
+            "Disgust for revulsion, Concern or Anxiety for worried reactions, Agreement for factual agreement, "
+            "and Neutral only for emotionally flat logistics, tags, simple facts, or unclear minimal text. "
             "requires_response should be true for good-faith questions, information requests, serious criticism, "
-            "or safety/reputation issues. Use high priority only when immediate organizational response is important.\n\n"
+            "or safety/reputation issues. Brand comments are excluded; do not ask Greenpeace to respond to itself. "
+            "Use high priority only when immediate organizational response is important.\n\n"
+            "Examples:\n"
+            '- "יאללה שקרנים הביתה" => emotions ["Anger","Hostility"], sentiment negative, tone hostile, stance opposed, intent criticism.\n'
+            '- "בבקשה תחליטו.. או אבולה או חייזרים" => emotions ["Sarcasm","Contempt"], sentiment negative, tone sarcastic, stance skeptical, intent mockery.\n'
+            '- "איפה חותמים?" => emotions ["Agreement"], sentiment positive, tone curious, stance supportive, intent information_request, requires_response true.\n'
+            '- "🔥🔥🥵😣" on a climate disaster post => emotions ["Concern","Anxiety"], sentiment mixed, tone worried, stance supportive.\n'
+            '- "@friend" or only tagging a friend => emotions ["Neutral"], sentiment neutral, tone neutral, intent tag_friend.\n\n'
             f"Comments:\n{json.dumps(items, ensure_ascii=False)}"
         )
         analysis = {item["comment_id"]: item for item in gemini_generate_json(prompt, schema).get("comments", [])}
         for comment in batch:
+            if comment.get("is_brand_comment"):
+                continue
             item = analysis.get(comment["comment_id"], {})
             comment["comment_emotions"] = allowed_list(item.get("comment_emotions"), COMMENT_EMOTIONS, ["Neutral"])
             comment["Emotion_Confidence"] = bounded_float(item.get("emotion_confidence"), 0.0, 1.0)
+            comment["comment_sentiment"] = allowed_value(item.get("comment_sentiment"), COMMENT_SENTIMENTS, "unclear")
+            comment["comment_tone"] = allowed_value(item.get("comment_tone"), COMMENT_TONES, "unclear")
             comment["comment_stance"] = allowed_value(item.get("comment_stance"), COMMENT_STANCES, "unclear")
             comment["comment_intent"] = allowed_value(item.get("comment_intent"), COMMENT_INTENTS, "other")
             comment["is_sarcastic"] = bool(item.get("is_sarcastic", False))
@@ -1395,6 +1513,8 @@ def bounded_float(value: Any, minimum: float, maximum: float) -> float:
 def summarize_posts(posts: list[dict[str, Any]], comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     comments_by_post: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for comment in comments:
+        if comment.get("is_brand_comment"):
+            continue
         comments_by_post[comment["post_id"]].append(comment)
 
     summaries = []
@@ -1440,7 +1560,13 @@ def sync() -> None:
     ensure_schema(service, spreadsheet_id)
 
     known_post_ids = existing_ids(service, spreadsheet_id, "Posts", POST_HEADERS, "post_id")
-    known_comment_ids = existing_ids(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS, "comment_id")
+    known_comment_ids, missing_comment_analysis_count = existing_analyzed_comment_ids(service, spreadsheet_id)
+    if missing_comment_analysis_count:
+        print(
+            f"Found {missing_comment_analysis_count} existing comments without the new analysis columns. "
+            "Rechecking posts in the selected date window."
+        )
+        known_post_ids = set()
     print(f"Found {len(known_post_ids)} existing posts and {len(known_comment_ids)} existing comments in Google Sheets.")
 
     posts, comments = collect_rows(known_post_ids, known_comment_ids)
