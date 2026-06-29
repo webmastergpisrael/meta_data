@@ -18,65 +18,67 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 POST_HEADERS = [
     "post_id",
     "platform",
+    "source_type",
+    "campaign_name",
+    "ad_id",
     "post_created_time",
-    "post_message",
     "post_url",
+    "media_type",
+    "post_message",
     "post_hashtags",
     "canonical_topic",
     "canonical_subtopic",
     "topic_source",
     "topic_confidence",
-    "source_type",
-    "campaign_name",
-    "ad_id",
-    "media_type",
+    "post_emotions",
+    "post_sentiment",
+    "post_tone",
+    "collected_like_count",
     "collected_comment_count",
     "collected_greenpeace_comment_count",
-    "collected_like_count",
     "collected_reply_count",
     "collected_window_start",
     "collected_window_end",
-    "post_emotions",
 ]
 
 COMMENT_HEADERS = [
     "comment_id",
     "post_id",
     "parent_comment_id",
+    "comment_created_time",
+    "collected_at",
     "commenter_id",
     "commenter_name",
-    "comment_created_time",
+    "is_brand_comment",
     "comment_message",
     "comment_url",
     "like_count",
     "reply_count",
-    "collected_at",
+    "comment_sentiment",
+    "comment_tone",
     "comment_emotions",
-    "Emotion_Confidence",
+    "emotion_confidence",
     "comment_stance",
     "comment_intent",
     "is_sarcastic",
     "requires_response",
     "response_priority",
-    "is_brand_comment",
-    "comment_sentiment",
-    "comment_tone",
 ]
 
 SUMMARY_HEADERS = [
     "post_id",
     "total_comments",
+    "requires_response_count",
+    "requires_response_rate",
     "dominant_comment_stance",
-    "dominant_comment_intent",
     "supportive_comment_rate",
     "opposed_comment_rate",
     "skeptical_comment_rate",
     "neutral_comment_rate",
+    "dominant_comment_intent",
     "question_rate",
     "criticism_rate",
     "mockery_rate",
-    "requires_response_count",
-    "requires_response_rate",
 ]
 
 FACEBOOK_COMMENT_FIELDS = ",".join(
@@ -92,7 +94,35 @@ FACEBOOK_COMMENT_FIELDS = ",".join(
     ]
 )
 
-POST_EMOTIONS = ["Awe", "Urgency", "Anger", "Grief", "Hope", "Sarcasm", "Amusement", "Neutral"]
+POST_EMOTIONS = [
+    "Urgency",
+    "Concern",
+    "Outrage",
+    "Anger",
+    "Grief",
+    "Hope",
+    "Empathy",
+    "Alarm",
+    "Determination",
+    "Awe",
+    "Sarcasm",
+    "Amusement",
+    "Neutral",
+]
+POST_SENTIMENTS = ["positive", "negative", "mixed", "neutral", "unclear"]
+POST_TONES = [
+    "informational",
+    "urgent",
+    "accusatory",
+    "warning",
+    "call_to_action",
+    "hopeful",
+    "critical",
+    "educational",
+    "emotional",
+    "neutral",
+    "unclear",
+]
 COMMENT_EMOTIONS = [
     "Admiration",
     "Sadness",
@@ -283,7 +313,7 @@ def ensure_sheet(service, spreadsheet_id: str, title: str, headers: list[str]) -
     current = get_values(service, spreadsheet_id, sheet_range(title, "1:1"))
     current_headers = [str(value).strip() for value in current[0]] if current else []
     if current_headers[: len(headers)] != headers:
-        update_values(service, spreadsheet_id, sheet_range(title, f"A1:{col_letter(len(headers))}1"), [headers])
+        migrate_sheet_headers(service, spreadsheet_id, title, current_headers, headers)
 
     if sheet:
         batch_update(
@@ -301,6 +331,69 @@ def ensure_sheet(service, spreadsheet_id: str, title: str, headers: list[str]) -
                 }
             ],
         )
+
+
+def migrate_sheet_headers(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    current_headers: list[str],
+    desired_headers: list[str],
+) -> None:
+    if not any(current_headers):
+        update_values(service, spreadsheet_id, sheet_range(sheet_name, f"A1:{col_letter(len(desired_headers))}1"), [desired_headers])
+        return
+
+    width = max(len(current_headers), len(desired_headers))
+    header_index = {header: index for index, header in enumerate(current_headers) if header}
+    if "Emotion_Confidence" in header_index and "emotion_confidence" not in header_index:
+        header_index["emotion_confidence"] = header_index["Emotion_Confidence"]
+
+    existing = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(width)}"))
+    migrated = []
+    for row in existing:
+        padded = pad_row(row, width)
+        migrated.append(
+            [
+                padded[header_index[header]]
+                if header in header_index
+                else default_cell_value(header)
+                for header in desired_headers
+            ]
+        )
+
+    update_values(service, spreadsheet_id, sheet_range(sheet_name, f"A1:{col_letter(len(desired_headers))}1"), [desired_headers])
+    if migrated:
+        update_values(
+            service,
+            spreadsheet_id,
+            sheet_range(sheet_name, f"A2:{col_letter(len(desired_headers))}{len(migrated) + 1}"),
+            migrated,
+        )
+    if width > len(desired_headers):
+        clear_values(service, spreadsheet_id, sheet_range(sheet_name, f"{col_letter(len(desired_headers) + 1)}:{col_letter(width)}"))
+
+
+def default_cell_value(header: str) -> str:
+    if header in {"post_hashtags", "post_emotions", "comment_emotions"}:
+        return "[]"
+    if header == "topic_source":
+        return "unknown"
+    if header == "source_type":
+        return "organic"
+    if header in {"post_sentiment", "post_tone", "is_brand_comment", "comment_sentiment", "comment_tone"}:
+        return ""
+    if header == "comment_stance":
+        return "unclear"
+    if header == "comment_intent":
+        return "other"
+    if header == "emotion_confidence":
+        return "0"
+    if header in {"is_sarcastic", "requires_response"}:
+        return "FALSE"
+    if header == "response_priority":
+        return "none"
+    return ""
 
 
 def ensure_schema(service, spreadsheet_id: str) -> None:
@@ -330,6 +423,34 @@ def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[st
         if value:
             output.add(value)
     return output
+
+
+def existing_analyzed_post_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
+    ensure_sheet(service, spreadsheet_id, "Posts", POST_HEADERS)
+    mapping = header_map(service, spreadsheet_id, "Posts", POST_HEADERS)
+    id_column = mapping.get("post_id")
+    if not id_column:
+        return set(), 0
+
+    required_columns = ["post_sentiment", "post_tone"]
+    rows = get_values(service, spreadsheet_id, sheet_range("Posts", f"A2:{col_letter(len(POST_HEADERS))}"))
+    analyzed_ids = set()
+    missing_analysis_count = 0
+    for row in rows:
+        padded = pad_row(row, len(POST_HEADERS))
+        post_id = str(padded[id_column - 1] or "").strip()
+        if not post_id:
+            continue
+
+        has_new_analysis = all(
+            mapping.get(header) and str(padded[mapping[header] - 1] or "").strip()
+            for header in required_columns
+        )
+        if has_new_analysis:
+            analyzed_ids.add(post_id)
+        else:
+            missing_analysis_count += 1
+    return analyzed_ids, missing_analysis_count
 
 
 def existing_analyzed_comment_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
@@ -849,7 +970,7 @@ def add_comment(
         "collected_at": datetime.now(timezone.utc).isoformat(),
         "is_brand_comment": False,
         "comment_emotions": ["Neutral"],
-        "Emotion_Confidence": 0.0,
+        "emotion_confidence": 0.0,
         "comment_sentiment": "neutral",
         "comment_tone": "neutral",
         "comment_stance": "unclear",
@@ -1126,6 +1247,8 @@ def make_post_row(
         "collected_window_start": collected_window_start.date().isoformat(),
         "collected_window_end": collected_window_end.date().isoformat(),
         "post_emotions": ["Neutral"],
+        "post_sentiment": "neutral",
+        "post_tone": "neutral",
     }
 
 
@@ -1324,6 +1447,8 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
                         "topic_source": {"type": "STRING", "enum": TOPIC_SOURCES},
                         "topic_confidence": {"type": "NUMBER"},
                         "post_emotions": {"type": "ARRAY", "items": {"type": "STRING", "enum": POST_EMOTIONS}},
+                        "post_sentiment": {"type": "STRING", "enum": POST_SENTIMENTS},
+                        "post_tone": {"type": "STRING", "enum": POST_TONES},
                     },
                     "required": [
                         "post_id",
@@ -1332,6 +1457,8 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
                         "topic_source",
                         "topic_confidence",
                         "post_emotions",
+                        "post_sentiment",
+                        "post_tone",
                     ],
                 },
             }
@@ -1351,10 +1478,26 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
             "Analyze this Greenpeace Israel social post. Return only valid JSON in this exact shape: "
             '{"posts":[{"post_id":"...","canonical_topic":"...","canonical_subtopic":"...",'
             '"topic_source":"hashtags|campaign_name|ad_text|ai_classification|manual|unknown",'
-            '"topic_confidence":0.0,"post_emotions":["Neutral"]}]}. '
+            '"topic_confidence":0.0,"post_emotions":["Neutral"],'
+            '"post_sentiment":"positive|negative|mixed|neutral|unclear",'
+            '"post_tone":"informational|urgent|accusatory|warning|call_to_action|hopeful|critical|educational|emotional|neutral|unclear"}]}. '
             "Use short snake_case English labels for canonical_topic and canonical_subtopic. "
             "topic_source must indicate the strongest source used: hashtags, campaign_name, ad_text, "
-            "ai_classification, manual, or unknown. Emotions must come from the allowed list.\n\n"
+            "ai_classification, manual, or unknown. Emotions, sentiment, and tone must come from the allowed lists. "
+            "Classify the emotional framing Greenpeace is using, not whether the facts are accurate. "
+            "Do not classify as Neutral when the post describes harm, death, extinction, pollution, corruption, "
+            "corporate responsibility, climate disasters, public health risks, injustice, or urgent calls to action. "
+            "If the post asks readers to sign, donate, act, stop something, or join a campaign, post_tone should usually "
+            "be call_to_action or urgent. If the post blames companies, politicians, polluters, or industries, "
+            "post_tone should usually be accusatory or critical. If the post describes danger, endangered species, "
+            "heat waves, pollution, or health risks, post_emotions should usually include Concern, Alarm, Urgency, "
+            "Grief, or Outrage. Use Neutral only for truly flat administrative or descriptive posts.\n\n"
+            "Examples:\n"
+            '- "הם ידעו מה הנזק ובחרו ברווחים 😡" => emotions ["Outrage","Urgency"], sentiment negative, tone accusatory.\n'
+            '- "גלי החום באירופה כבר שוברים שיאים... גבה את חייהם" => emotions ["Alarm","Concern","Urgency"], sentiment negative, tone warning.\n'
+            '- "חתמו על העצומה... ליצור שמורות ימיות" => emotions ["Concern","Hope","Urgency"], sentiment mixed, tone call_to_action.\n'
+            '- "דוח חדש של FAO חושף..." => emotions ["Concern"], sentiment negative, tone informational.\n'
+            '- "הצטרפו אלינו לאירוע קהילתי בגינה" => emotions ["Hope"], sentiment positive, tone call_to_action.\n\n'
             f"Post:\n{json.dumps(item_for_prompt, ensure_ascii=False)}"
         )
         analysis = {item["post_id"]: item for item in gemini_generate_json(prompt, schema).get("posts", [])}
@@ -1364,6 +1507,8 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
         post["topic_source"] = allowed_value(item.get("topic_source"), TOPIC_SOURCES, "unknown")
         post["topic_confidence"] = bounded_float(item.get("topic_confidence"), 0.0, 1.0)
         post["post_emotions"] = allowed_list(item.get("post_emotions"), POST_EMOTIONS, ["Neutral"])
+        post["post_sentiment"] = allowed_value(item.get("post_sentiment"), POST_SENTIMENTS, "unclear")
+        post["post_tone"] = allowed_value(item.get("post_tone"), POST_TONES, "unclear")
 
 
 def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]) -> None:
@@ -1420,7 +1565,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
         for comment in batch:
             if comment.get("is_brand_comment"):
                 comment["comment_emotions"] = ["Neutral"]
-                comment["Emotion_Confidence"] = 1.0
+                comment["emotion_confidence"] = 1.0
                 comment["comment_sentiment"] = "neutral"
                 comment["comment_tone"] = "informational"
                 comment["comment_stance"] = "neutral"
@@ -1480,7 +1625,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                 continue
             item = analysis.get(comment["comment_id"], {})
             comment["comment_emotions"] = allowed_list(item.get("comment_emotions"), COMMENT_EMOTIONS, ["Neutral"])
-            comment["Emotion_Confidence"] = bounded_float(item.get("emotion_confidence"), 0.0, 1.0)
+            comment["emotion_confidence"] = bounded_float(item.get("emotion_confidence"), 0.0, 1.0)
             comment["comment_sentiment"] = allowed_value(item.get("comment_sentiment"), COMMENT_SENTIMENTS, "unclear")
             comment["comment_tone"] = allowed_value(item.get("comment_tone"), COMMENT_TONES, "unclear")
             comment["comment_stance"] = allowed_value(item.get("comment_stance"), COMMENT_STANCES, "unclear")
@@ -1559,8 +1704,13 @@ def sync() -> None:
     service = get_sheets_service()
     ensure_schema(service, spreadsheet_id)
 
-    known_post_ids = existing_ids(service, spreadsheet_id, "Posts", POST_HEADERS, "post_id")
+    known_post_ids, missing_post_analysis_count = existing_analyzed_post_ids(service, spreadsheet_id)
     known_comment_ids, missing_comment_analysis_count = existing_analyzed_comment_ids(service, spreadsheet_id)
+    if missing_post_analysis_count:
+        print(
+            f"Found {missing_post_analysis_count} existing posts without the new analysis columns. "
+            "Rechecking posts in the selected date window."
+        )
     if missing_comment_analysis_count:
         print(
             f"Found {missing_comment_analysis_count} existing comments without the new analysis columns. "
