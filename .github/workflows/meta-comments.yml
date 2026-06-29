@@ -8,21 +8,33 @@ on:
         required: false
         default: "1"
       max_instagram_media:
-        description: "How many Instagram media items to fetch"
+        description: "How many Instagram posts to fetch"
         required: false
         default: "1"
-      max_ads:
-        description: "How many paid ads to fetch"
+      max_paid_posts:
+        description: "How many paid posts to fetch"
         required: false
         default: "0"
+      max_ads:
+        description: "How many ads to scan"
+        required: false
+        default: "10"
+      max_comments:
+        description: "How many comments to fetch total"
+        required: false
+        default: "10"
       max_comments_per_post:
-        description: "How many top-level comments per post/media/ad"
+        description: "How many comments to fetch per post/media/paid post"
         required: false
         default: "5"
-      max_replies_per_comment:
-        description: "How many replies per top-level comment"
+      start_date:
+        description: "Start date, YYYY-MM-DD. Leave blank for the last 7 days."
         required: false
-        default: "2"
+        default: ""
+      end_date:
+        description: "End date, YYYY-MM-DD. Leave blank for today."
+        required: false
+        default: ""
   schedule:
     - cron: "0 3 * * *"
 
@@ -53,11 +65,12 @@ jobs:
           GEMINI_API_MODE: ${{ vars.GEMINI_API_MODE || 'generateContent' }}
           MAX_FACEBOOK_POSTS: ${{ github.event.inputs.max_facebook_posts || vars.MAX_FACEBOOK_POSTS || '1' }}
           MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
-          MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '0' }}
+          MAX_PAID_POSTS: ${{ github.event.inputs.max_paid_posts || vars.MAX_PAID_POSTS || '0' }}
+          MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '10' }}
+          MAX_COMMENTS: ${{ github.event.inputs.max_comments || vars.MAX_COMMENTS || '10' }}
           MAX_COMMENTS_PER_POST: ${{ github.event.inputs.max_comments_per_post || vars.MAX_COMMENTS_PER_POST || '5' }}
-          MAX_REPLIES_PER_COMMENT: ${{ github.event.inputs.max_replies_per_comment || vars.MAX_REPLIES_PER_COMMENT || '2' }}
-          COMMENT_LOOKBACK_DAYS: ${{ vars.COMMENT_LOOKBACK_DAYS || '7' }}
-          POST_LOOKBACK_DAYS: ${{ vars.POST_LOOKBACK_DAYS || '14' }}
+          START_DATE: ${{ github.event.inputs.start_date || vars.START_DATE || '' }}
+          END_DATE: ${{ github.event.inputs.end_date || vars.END_DATE || '' }}
           GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '1' }}
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
           GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '0' }}
