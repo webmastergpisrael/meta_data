@@ -19,10 +19,6 @@ on:
         description: "How many ads to scan"
         required: false
         default: "10"
-      max_comments:
-        description: "How many comments to fetch total"
-        required: false
-        default: "10"
       max_comments_per_post:
         description: "How many comments to fetch per post/media/paid post"
         required: false
@@ -67,7 +63,6 @@ jobs:
           MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
           MAX_PAID_POSTS: ${{ github.event.inputs.max_paid_posts || vars.MAX_PAID_POSTS || '0' }}
           MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '10' }}
-          MAX_COMMENTS: ${{ github.event.inputs.max_comments || vars.MAX_COMMENTS || '10' }}
           MAX_COMMENTS_PER_POST: ${{ github.event.inputs.max_comments_per_post || vars.MAX_COMMENTS_PER_POST || '5' }}
           START_DATE: ${{ github.event.inputs.start_date || vars.START_DATE || '' }}
           END_DATE: ${{ github.event.inputs.end_date || vars.END_DATE || '' }}
