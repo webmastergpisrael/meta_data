@@ -199,7 +199,6 @@ CONFIG = {
     "max_instagram_media": env_int("MAX_INSTAGRAM_MEDIA", 1),
     "max_paid_posts": env_int("MAX_PAID_POSTS", 0),
     "max_ads": env_int("MAX_ADS", 10),
-    "max_comments": env_int("MAX_COMMENTS", 10),
     "max_comments_per_post": env_int("MAX_COMMENTS_PER_POST", 5),
     "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 1),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
@@ -1018,14 +1017,6 @@ def collect_visible_comments(
                 collected += 1
 
 
-def remaining_comment_limit(comments: list[dict[str, Any]]) -> int:
-    return max(CONFIG["max_comments"] - len(comments), 0)
-
-
-def per_post_comment_limit(comments: list[dict[str, Any]]) -> int:
-    return min(CONFIG["max_comments_per_post"], remaining_comment_limit(comments))
-
-
 def collect_rows(
     existing_post_ids: set[str] | None = None,
     existing_comment_ids: set[str] | None = None,
@@ -1046,7 +1037,7 @@ def collect_rows(
         if not post_id or post_id in existing_post_ids:
             continue
 
-        comment_limit = per_post_comment_limit(comments)
+        comment_limit = CONFIG["max_comments_per_post"]
         if comment_limit > 0:
             post_comments = fetch_facebook_comments_with_replies(post_id, window_start, window_end, page_token, comment_limit)
             collect_visible_comments(
@@ -1084,7 +1075,7 @@ def collect_rows(
         if not post_id or post_id in existing_post_ids:
             continue
 
-        comment_limit = per_post_comment_limit(comments)
+        comment_limit = CONFIG["max_comments_per_post"]
         if comment_limit > 0:
             post_comments = fetch_instagram_comments(post_id, window_start, window_end, access_token, comment_limit)
             collect_visible_comments(
@@ -1129,7 +1120,7 @@ def collect_rows(
             if object_id not in existing_post_ids:
                 ad_post = fetch_facebook_object(object_id, page_token)
                 if is_within(ad_post.get("created_time", ""), window_start, window_end):
-                    comment_limit = per_post_comment_limit(comments)
+                    comment_limit = CONFIG["max_comments_per_post"]
                     if comment_limit > 0:
                         ad_comments = fetch_facebook_comments_with_replies(
                             object_id,
@@ -1172,7 +1163,7 @@ def collect_rows(
         if creative.get("effective_instagram_media_id"):
             media_id = creative["effective_instagram_media_id"]
             if media_id not in existing_post_ids:
-                comment_limit = per_post_comment_limit(comments)
+                comment_limit = CONFIG["max_comments_per_post"]
                 ad_media = fetch_instagram_media_by_id(media_id, access_token, comment_limit)
                 if is_within(ad_media.get("timestamp", ""), window_start, window_end):
                     if comment_limit > 0:
