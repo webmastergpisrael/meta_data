@@ -28,10 +28,9 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables` if you 
 - `MAX_INSTAGRAM_MEDIA` - default: `1`.
 - `MAX_PAID_POSTS` - default: `0`. Counts paid Facebook/Instagram posts together.
 - `MAX_ADS` - default: `10`. Counts ads to scan while looking for paid posts.
-- `MAX_COMMENTS` - default: `10`. Counts top-level comments and replies together across the whole run.
-- `MAX_COMMENTS_PER_POST` - default: `5`. Counts top-level comments and replies together per post/media/paid post.
-- `START_DATE` - optional `YYYY-MM-DD`; blank means 7 days before `END_DATE` or now.
-- `END_DATE` - optional `YYYY-MM-DD`; blank means the current time.
+- `MAX_COMMENTS_PER_POST` - default: `5`. Counts audience top-level comments and replies together per post/media/paid post.
+- `MAX_BRAND_COMMENTS_PER_POST` - default: `0`. Counts official Greenpeace comments separately per post/media/paid post.
+- `LOOKBACK_DAYS` - default: `7`. Counts backward from the current time.
 - `GEMINI_BATCH_SIZE` - default: `1`.
 - `ANALYSIS_TEXT_CHARS` - default: `1200`.
 - `GEMINI_MAX_RETRIES` - default: `0`.
@@ -45,12 +44,12 @@ The `Post Comments` sheet includes the original emotion fields plus:
 
 - `is_brand_comment` - marks official Greenpeace replies so they are not treated as audience sentiment.
 - `comment_sentiment` - `positive`, `negative`, `mixed`, `neutral`, or `unclear`.
-- `comment_tone` - tone such as `hostile`, `sarcastic`, `worried`, `supportive`, `curious`, or `dismissive`.
+- `comment_intent` includes `service_request` for donation, unsubscribe, billing, or account-support comments.
+- Official Greenpeace comments keep response-analysis fields blank.
 
 The `Posts` sheet includes:
 
 - `post_sentiment` - `positive`, `negative`, `mixed`, `neutral`, or `unclear`.
-- `post_tone` - tone such as `informational`, `urgent`, `accusatory`, `warning`, `call_to_action`, or `critical`.
 
 ## First Run
 
