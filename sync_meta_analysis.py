@@ -537,9 +537,20 @@ def fetch_json(url: str) -> dict[str, Any]:
     return data
 
 
+def meta_page_limit(value: Any, default: int = 100) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, 100))
+
+
 def get_all_pages(path: str, params: dict[str, Any], access_token: str, max_items: int) -> list[dict[str, Any]]:
     output = []
-    url = graph_url(path, params, access_token)
+    page_params = dict(params)
+    if "limit" in page_params:
+        page_params["limit"] = meta_page_limit(page_params["limit"])
+    url = graph_url(path, page_params, access_token)
     while url:
         data = fetch_json(url)
         for item in data.get("data", []):
@@ -735,7 +746,8 @@ def fetch_facebook_comments_with_replies(
 ):
     if max_comments <= 0:
         return []
-    replies = f"comments.limit({max_comments}){{{FACEBOOK_COMMENT_FIELDS}}}"
+    page_limit = meta_page_limit(max_comments)
+    replies = f"comments.limit({page_limit}){{{FACEBOOK_COMMENT_FIELDS}}}"
     fields = f"{FACEBOOK_COMMENT_FIELDS},{replies}"
     comments = get_all_pages(
         f"/{object_id}/comments",
@@ -745,7 +757,7 @@ def fetch_facebook_comments_with_replies(
             "order": "chronological",
             "since": to_unix(since_date),
             "until": to_unix(until_date),
-            "limit": max_comments,
+            "limit": page_limit,
         },
         access_token,
         max_comments,
@@ -762,11 +774,12 @@ def fetch_instagram_comments(
 ):
     if max_comments <= 0:
         return []
-    replies = f"replies.limit({max_comments}){{id,text,timestamp,username,like_count}}"
+    page_limit = meta_page_limit(max_comments)
+    replies = f"replies.limit({page_limit}){{id,text,timestamp,username,like_count}}"
     fields = f"id,text,timestamp,username,like_count,{replies}"
     comments = get_all_pages(
         f"/{media_id}/comments",
-        {"fields": fields, "limit": max_comments},
+        {"fields": fields, "limit": page_limit},
         access_token,
         max_comments,
     )
@@ -808,6 +821,7 @@ def fetch_facebook_comments(
 ):
     if max_comments <= 0:
         return []
+    page_limit = meta_page_limit(max_comments)
     comments = get_all_pages(
         f"/{object_id}/comments",
         {
@@ -816,7 +830,7 @@ def fetch_facebook_comments(
             "order": "chronological",
             "since": to_unix(since_date),
             "until": to_unix(until_date),
-            "limit": max_comments,
+            "limit": page_limit,
         },
         access_token,
         max_comments,
@@ -835,12 +849,13 @@ def fetch_instagram_media_by_id(media_id: str, access_token: str, max_comments: 
                 access_token,
             )
         )
+    page_limit = meta_page_limit(max_comments)
     replies = (
-        f"replies.limit({max_comments})"
+        f"replies.limit({page_limit})"
         "{id,text,timestamp,username,like_count}"
     )
     comments = (
-        f"comments.limit({max_comments})"
+        f"comments.limit({page_limit})"
         f"{{id,text,timestamp,username,like_count,{replies}}}"
     )
     return fetch_json(
