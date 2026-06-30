@@ -192,8 +192,7 @@ CONFIG = {
     "ig_user_id": "",
     "ad_account_id": "",
     "graph_version": env_value("META_GRAPH_VERSION", "v23.0"),
-    "start_date": env_value("START_DATE"),
-    "end_date": env_value("END_DATE"),
+    "lookback_days": env_int("LOOKBACK_DAYS", 7),
     "timezone": env_value("TIMEZONE", "UTC"),
     "max_facebook_posts": env_int("MAX_FACEBOOK_POSTS", 1),
     "max_instagram_media": env_int("MAX_INSTAGRAM_MEDIA", 1),
@@ -598,31 +597,12 @@ def configured_timezone():
         return timezone.utc
 
 
-def parse_window_date(value: str, is_end: bool, local_tz) -> datetime | None:
-    value = clean_text(value)
-    if not value:
-        return None
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        parsed = datetime.strptime(value, "%Y-%m-%d")
-        if is_end:
-            parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
-        return parsed.replace(tzinfo=local_tz).astimezone(timezone.utc)
-
-    normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
-    if not parsed.tzinfo:
-        parsed = parsed.replace(tzinfo=local_tz)
-    return parsed.astimezone(timezone.utc)
-
-
 def collection_window() -> tuple[datetime, datetime]:
     local_tz = configured_timezone()
-    now = datetime.now(timezone.utc)
-    end_date = parse_window_date(CONFIG["end_date"], True, local_tz) or now
-    start_date = parse_window_date(CONFIG["start_date"], False, local_tz) or (end_date - timedelta(days=7))
-    if start_date > end_date:
-        raise RuntimeError("START_DATE must be before or equal to END_DATE.")
-    return start_date, end_date
+    lookback_days = max(1, CONFIG["lookback_days"])
+    end_date = datetime.now(local_tz)
+    start_date = end_date - timedelta(days=lookback_days)
+    return start_date.astimezone(timezone.utc), end_date.astimezone(timezone.utc)
 
 
 def clean_text(value: Any) -> str:
