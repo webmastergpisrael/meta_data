@@ -115,7 +115,6 @@ COMMENT_EMOTIONS = [
     "Sadness",
     "Skepticism",
     "Anger",
-    "Sarcasm",
     "Anxiety",
     "Amusement",
     "Contempt",
@@ -1583,8 +1582,8 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "Emoji-only comments must be interpreted from emoji meaning plus post context. "
             "If comment_stance is opposed or skeptical and comment_intent is criticism or mockery, "
             "comment_emotions should usually not be only Neutral unless the text is purely factual and calm. "
-            "Sarcastic comments should usually include Sarcasm plus another emotion such as Contempt, "
-            "Dismissiveness, Anger, Amusement, Skepticism, or Hostility. "
+            "For sarcastic comments, set is_sarcastic=true and use the underlying emotion such as Contempt, "
+            "Dismissiveness, Anger, Amusement, Skepticism, or Hostility. Do not use Sarcasm as a comment emotion. "
             "Use Contempt/Dismissiveness for belittling or sneering comments, Hostility for personal attacks, "
             "Disgust for revulsion, Concern or Anxiety for worried reactions, Agreement for factual agreement, "
             "and Neutral only for emotionally flat logistics, tags, simple facts, or unclear minimal text. "
@@ -1595,7 +1594,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "Use high priority only when immediate organizational response is important.\n\n"
             "Examples:\n"
             '- "יאללה שקרנים הביתה" => emotions ["Anger","Hostility"], sentiment negative, stance opposed, intent criticism.\n'
-            '- "בבקשה תחליטו.. או אבולה או חייזרים" => emotions ["Sarcasm","Contempt"], sentiment negative, stance skeptical, intent mockery.\n'
+            '- "בבקשה תחליטו.. או אבולה או חייזרים" => emotions ["Contempt"], sentiment negative, stance skeptical, intent mockery, is_sarcastic true.\n'
             '- "איפה חותמים?" => emotions ["Agreement"], sentiment positive, stance supportive, intent information_request, requires_response true.\n'
             '- "🔥🔥🥵😣" on a climate disaster post => emotions ["Concern","Anxiety"], sentiment mixed, stance supportive.\n'
             '- "@friend" or only tagging a friend => emotions ["Neutral"], sentiment neutral, intent tag_friend.\n\n'
