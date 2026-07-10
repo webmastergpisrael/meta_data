@@ -18,7 +18,7 @@ POSTS_SHEET_NAME = "Posts/Ads"
 POST_COMMENTS_SHEET_NAME = "Post/Ad Comments"
 POST_SUMMARY_SHEET_NAME = "Post/Ad Summary"
 LEGACY_POSTS_SHEET_NAMES = ["Posts"]
-LEGACY_POST_COMMENTS_SHEET_NAMES = ["Post Comments"]
+LEGACY_POST_COMMENTS_SHEET_NAMES = ["Post Comments", "Meta Comments", "Facebook Comments"]
 LEGACY_POST_SUMMARY_SHEET_NAMES = ["Post Summary"]
 
 POST_HEADERS = [
@@ -276,6 +276,11 @@ def append_values(service, spreadsheet_id: str, range_name: str, values: list[li
     ).execute()
 
 
+def data_row_count(service, spreadsheet_id: str, sheet_name: str, headers: list[str]) -> int:
+    rows = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"))
+    return sum(1 for row in rows if any(str(value).strip() for value in row))
+
+
 def clear_values(service, spreadsheet_id: str, range_name: str) -> None:
     service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=range_name, body={}).execute()
 
@@ -513,10 +518,11 @@ def upsert_by_key(
     headers: list[str],
     key_fields: list[str],
     rows: list[dict[str, Any]],
-) -> None:
+) -> tuple[int, int, int]:
     ensure_sheet(service, spreadsheet_id, sheet_name, headers)
     if not rows:
-        return
+        total_rows = data_row_count(service, spreadsheet_id, sheet_name, headers)
+        return 0, 0, total_rows
 
     existing = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"))
     existing_keys: dict[str, int] = {}
@@ -551,6 +557,8 @@ def upsert_by_key(
         ).execute()
     if appends:
         append_values(service, spreadsheet_id, sheet_range(sheet_name, f"A:{col_letter(len(headers))}"), appends)
+    total_rows = data_row_count(service, spreadsheet_id, sheet_name, headers)
+    return len(updates), len(appends), total_rows
 
 
 def serialize_cell(value: Any) -> Any:
@@ -1747,6 +1755,7 @@ def sync() -> None:
     spreadsheet_id = required_env("SPREADSHEET_ID")
     service = get_sheets_service()
     ensure_schema(service, spreadsheet_id)
+    print(f"Writing to Google Sheets spreadsheet: {spreadsheet_id}")
 
     known_post_ids, missing_post_analysis_count = existing_analyzed_post_ids(service, spreadsheet_id)
     known_comment_ids, missing_comment_analysis_count = existing_analyzed_comment_ids(service, spreadsheet_id)
@@ -1769,9 +1778,22 @@ def sync() -> None:
         analyze_comments(comments, posts)
 
     summaries = summarize_posts(posts, comments)
-    upsert_by_key(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts)
-    upsert_by_key(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, ["comment_id"], comments)
-    upsert_by_key(service, spreadsheet_id, POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, ["post_id"], summaries)
+    write_results = [
+        (
+            POSTS_SHEET_NAME,
+            upsert_by_key(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts),
+        ),
+        (
+            POST_COMMENTS_SHEET_NAME,
+            upsert_by_key(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, ["comment_id"], comments),
+        ),
+        (
+            POST_SUMMARY_SHEET_NAME,
+            upsert_by_key(service, spreadsheet_id, POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, ["post_id"], summaries),
+        ),
+    ]
+    for sheet_name, (updated, appended, total_rows) in write_results:
+        print(f"Sheet '{sheet_name}': updated {updated}, appended {appended}, total data rows {total_rows}.")
     print(f"Synced {len(posts)} posts, {len(comments)} comments/replies, {len(summaries)} summaries.")
 
 
