@@ -672,6 +672,10 @@ def is_within(date_value: str, since_date: datetime, until_date: datetime) -> bo
     return bool(parsed and since_date <= parsed <= until_date)
 
 
+def meta_date_sort_key(item: dict[str, Any], date_field: str) -> datetime:
+    return parse_meta_date(str(item.get(date_field) or "")) or datetime.min.replace(tzinfo=timezone.utc)
+
+
 def configured_timezone():
     try:
         return ZoneInfo(CONFIG["timezone"])
@@ -1117,7 +1121,12 @@ def collect_visible_comments(
         if is_within(comment.get(date_field, ""), since_date, until_date):
             keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", "", post_url))
 
-        for reply in (comment.get(replies_field, {}).get("data") or []):
+        previous_message = comment_text(comment, platform)
+        replies = sorted(
+            comment.get(replies_field, {}).get("data") or [],
+            key=lambda item: meta_date_sort_key(item, date_field),
+        )
+        for reply in replies:
             if limits_reached():
                 break
             if not is_within(reply.get(date_field, ""), since_date, until_date):
@@ -1130,10 +1139,11 @@ def collect_visible_comments(
                     post_id,
                     reply,
                     comment.get("id", ""),
-                    comment_text(comment, platform),
+                    previous_message,
                     post_url,
                 )
             )
+            previous_message = comment_text(reply, platform)
 
 
 def collect_rows(
@@ -1703,8 +1713,9 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
         prompt = (
             "Analyze Hebrew/English social media comments for Greenpeace Israel. "
             "Classify audience reaction to Greenpeace content, not the emotion of the post itself. "
-            "For replies, use parent_comment_message as conversational context so sarcasm, agreement, disagreement, "
-            "or answer intent can be interpreted correctly; classify only comment_message, not the parent text. "
+            "For replies, parent_comment_message contains the immediately previous message in the reply thread. "
+            "Use it as conversational context so sarcasm, agreement, disagreement, or answer intent can be interpreted correctly; "
+            "classify only comment_message, not the previous message. "
             "Return only valid JSON in this exact shape: "
             '{"comments":[{"comment_id":"...","comment_emotions":["Neutral"],"emotion_confidence":0.0,'
             '"comment_sentiment":"positive|negative|mixed|neutral|unclear",'
