@@ -54,6 +54,7 @@ COMMENT_HEADERS = [
     "comment_id",
     "post_id",
     "parent_comment_id",
+    "parent_comment_message",
     "comment_created_time",
     "collected_at",
     "commenter_id",
@@ -71,6 +72,7 @@ COMMENT_HEADERS = [
     "is_sarcastic",
     "requires_response",
     "response_priority",
+    "response_value_score",
 ]
 
 SUMMARY_HEADERS = [
@@ -415,6 +417,8 @@ def default_cell_value(header: str) -> str:
     if header == "comment_intent":
         return "other"
     if header == "emotion_confidence":
+        return "0"
+    if header == "response_value_score":
         return "0"
     if header in {"is_sarcastic", "requires_response"}:
         return "FALSE"
@@ -988,6 +992,10 @@ def is_greenpeace_comment(comment: dict[str, Any], platform: str) -> bool:
     return bool(official and username == official)
 
 
+def comment_text(comment: dict[str, Any], platform: str) -> str:
+    return str(comment.get("message" if platform == "facebook" else "text") or "")
+
+
 def add_comment(
     comments: list[dict[str, Any]],
     seen: set[str],
@@ -995,6 +1003,7 @@ def add_comment(
     post_id: str,
     raw_comment: dict[str, Any],
     parent_comment_id: str,
+    parent_comment_message: str,
     post_url: str,
 ) -> dict[str, Any] | None:
     comment_id = str(raw_comment.get("id") or "")
@@ -1021,6 +1030,7 @@ def add_comment(
         "comment_id": comment_id,
         "post_id": post_id,
         "parent_comment_id": parent_comment_id or raw_comment.get("parent", {}).get("id", ""),
+        "parent_comment_message": clean_text(parent_comment_message),
         "commenter_id": commenter_id,
         "commenter_name": commenter_name,
         "comment_created_time": created_time,
@@ -1038,6 +1048,7 @@ def add_comment(
         "is_sarcastic": False,
         "requires_response": False,
         "response_priority": "none",
+        "response_value_score": 0.0,
     }
     row["is_brand_comment"] = is_greenpeace_comment(row, platform)
     comments.append(row)
@@ -1061,6 +1072,7 @@ def clear_brand_comment_analysis(comment: dict[str, Any]) -> None:
     comment["is_sarcastic"] = ""
     comment["requires_response"] = ""
     comment["response_priority"] = ""
+    comment["response_value_score"] = ""
 
 
 def collect_visible_comments(
@@ -1103,14 +1115,25 @@ def collect_visible_comments(
         if limits_reached():
             break
         if is_within(comment.get(date_field, ""), since_date, until_date):
-            keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", post_url))
+            keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", "", post_url))
 
         for reply in (comment.get(replies_field, {}).get("data") or []):
             if limits_reached():
                 break
             if not is_within(reply.get(date_field, ""), since_date, until_date):
                 continue
-            keep_added_comment(add_comment(comments, seen, platform, post_id, reply, comment.get("id", ""), post_url))
+            keep_added_comment(
+                add_comment(
+                    comments,
+                    seen,
+                    platform,
+                    post_id,
+                    reply,
+                    comment.get("id", ""),
+                    comment_text(comment, platform),
+                    post_url,
+                )
+            )
 
 
 def collect_rows(
@@ -1578,6 +1601,11 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
             "Use short snake_case English labels for canonical_topic and canonical_subtopic. "
             "topic_source must indicate the strongest source used: hashtags, campaign_name, ad_text, "
             "ai_classification, manual, or unknown. Emotions and sentiment must come from the allowed lists. "
+            "Calibrate topic_confidence: use 0.95 only when the topic/subtopic is explicit in hashtags, campaign name, "
+            "or repeated direct post language; use 0.85-0.90 when the topic is strongly supported but requires some interpretation; "
+            "use 0.65-0.80 when the topic is inferred from context, broad framing, or ambiguous wording; "
+            "use 0.40-0.60 when multiple topics could reasonably fit; use below 0.40 when the text is too minimal or unclear. "
+            "Do not assign 0.95 by default. "
             "Classify the emotional framing Greenpeace is using, not whether the facts are accurate. "
             "Do not classify as Neutral when the post describes harm, death, extinction, pollution, corruption, "
             "corporate responsibility, climate disasters, public health risks, injustice, or urgent calls to action. "
@@ -1633,6 +1661,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "is_sarcastic": {"type": "BOOLEAN"},
                         "requires_response": {"type": "BOOLEAN"},
                         "response_priority": {"type": "STRING", "enum": RESPONSE_PRIORITIES},
+                        "response_value_score": {"type": "NUMBER"},
                     },
                     "required": [
                         "comment_id",
@@ -1644,6 +1673,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "is_sarcastic",
                         "requires_response",
                         "response_priority",
+                        "response_value_score",
                     ],
                 },
             }
@@ -1661,6 +1691,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                 "comment_id": comment["comment_id"],
                 "post_id": comment["post_id"],
                 "post_context": post_context.get(comment["post_id"], ""),
+                "parent_comment_message": truncate_text(comment.get("parent_comment_message", "")),
                 "comment_message": truncate_text(comment["comment_message"]),
                 "is_brand_comment": bool(comment.get("is_brand_comment")),
             }
@@ -1672,12 +1703,15 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
         prompt = (
             "Analyze Hebrew/English social media comments for Greenpeace Israel. "
             "Classify audience reaction to Greenpeace content, not the emotion of the post itself. "
+            "For replies, use parent_comment_message as conversational context so sarcasm, agreement, disagreement, "
+            "or answer intent can be interpreted correctly; classify only comment_message, not the parent text. "
             "Return only valid JSON in this exact shape: "
             '{"comments":[{"comment_id":"...","comment_emotions":["Neutral"],"emotion_confidence":0.0,'
             '"comment_sentiment":"positive|negative|mixed|neutral|unclear",'
             '"comment_stance":"supportive|opposed|skeptical|neutral|unclear",'
             '"comment_intent":"support|criticism|question|mockery|information_request|service_request|personal_story|tag_friend|political_attack|spam|other",'
-            '"is_sarcastic":false,"requires_response":false,"response_priority":"none|low|medium|high"}]}. '
+            '"is_sarcastic":false,"requires_response":false,"response_priority":"none|low|medium|high",'
+            '"response_value_score":0.0}]}. '
             "Use the closed lists exactly. "
             "Do not classify a comment as Neutral when it contains insults, accusations, mockery, sarcasm, "
             "conspiracy claims, hostile language, disgust, anxiety, sadness, or clear support. "
@@ -1693,7 +1727,22 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "Use service_request for donation, account, unsubscribe, billing, or operational support requests. "
             "requires_response should be true for good-faith questions, information requests, serious criticism, "
             "or safety/reputation issues. Brand comments are excluded; do not ask Greenpeace to respond to itself. "
-            "Use high priority only when immediate organizational response is important.\n\n"
+            "Use high priority only when immediate organizational response is important. "
+            "Set response_value_score from 0.0 to 1.0 to estimate how much Greenpeace would benefit by replying publicly. "
+            "Use 0.90-1.00 for comments where a reply can prevent reputational harm, correct serious misinformation, "
+            "answer a high-value public question, de-escalate a visible conflict, or convert strong engagement into action. "
+            "Use 0.70-0.89 for good-faith criticism, substantive skepticism, useful questions, or comments where a clear answer "
+            "could educate other readers. Use 0.40-0.69 for moderate engagement or ambiguous criticism where a reply may help but is not essential. "
+            "Use 0.10-0.39 for low-value agreement, brief reactions, repetitive criticism, or comments unlikely to change audience perception. "
+            "Use 0.00 for spam, tags, brand comments, or comments where replying has no clear organizational benefit. "
+            "This score is not the same as response_priority: response_priority is urgency, response_value_score is expected organizational benefit. "
+            "Calibrate emotion_confidence: use 0.95 only when the emotion/stance is explicit and unambiguous, "
+            "such as clear insults, strong praise, direct support, or direct hostility; use 0.85-0.90 when the classification is strong "
+            "but depends on context or interpretation; use 0.65-0.80 for questions, short comments, sarcasm, mixed signals, "
+            "or implied rather than explicit emotion; use 0.40-0.60 when several classifications could reasonably fit; "
+            "use below 0.40 when the text is too minimal, unclear, or mostly context-free. "
+            "Do not assign high confidence when fields conflict, for example positive/supportive with only Neutral emotion. "
+            "Do not assign 0.90 or 0.95 by default.\n\n"
             "Examples:\n"
             '- "יאללה שקרנים הביתה" => emotions ["Anger","Hostility"], sentiment negative, stance opposed, intent criticism.\n'
             '- "בבקשה תחליטו.. או אבולה או חייזרים" => emotions ["Contempt"], sentiment negative, stance skeptical, intent mockery, is_sarcastic true.\n'
@@ -1715,6 +1764,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             comment["is_sarcastic"] = bool(item.get("is_sarcastic", False))
             comment["requires_response"] = bool(item.get("requires_response", False))
             comment["response_priority"] = allowed_value(item.get("response_priority"), RESPONSE_PRIORITIES, "none")
+            comment["response_value_score"] = bounded_float(item.get("response_value_score"), 0.0, 1.0)
 
 
 def allowed_value(value: Any, allowed: list[str], default: str) -> str:
