@@ -14,6 +14,10 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+LEGACY_GEMINI_MODEL_UPGRADES = {
+    "gemini-2.5-flash-lite": DEFAULT_GEMINI_MODEL,
+}
 POSTS_SHEET_NAME = "Posts/Ads"
 POST_COMMENTS_SHEET_NAME = "Post/Ad Comments"
 POST_SUMMARY_SHEET_NAME = "Post/Ad Summary"
@@ -165,6 +169,15 @@ def env_bool(name: str, default: bool) -> bool:
     return value in {"1", "true", "yes", "y"}
 
 
+def gemini_model_from_env() -> str:
+    model = env_value("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    upgraded_model = LEGACY_GEMINI_MODEL_UPGRADES.get(model)
+    if upgraded_model:
+        print(f"Upgrading legacy GEMINI_MODEL '{model}' to '{upgraded_model}'.")
+        return upgraded_model
+    return model
+
+
 CONFIG = {
     "spreadsheet_id": env_value("SPREADSHEET_ID"),
     "page_id": "",
@@ -184,7 +197,7 @@ CONFIG = {
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 3),
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 20),
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", False),
-    "gemini_model": env_value("GEMINI_MODEL", "gemini-3.5-flash"),
+    "gemini_model": gemini_model_from_env(),
     "gemini_api_mode": env_value("GEMINI_API_MODE", "generateContent"),
     "gemini_fallback_after_quota_error": env_bool("GEMINI_FALLBACK_AFTER_QUOTA_ERROR", False),
     "gemini_quota_exhausted": False,
@@ -266,19 +279,9 @@ def get_values(service, spreadsheet_id: str, range_name: str) -> list[list[Any]]
     return response.get("values", [])
 
 
-def append_values(service, spreadsheet_id: str, range_name: str, values: list[list[Any]]) -> None:
-    service.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
-        range=range_name,
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": values},
-    ).execute()
-
-
-def data_row_count(service, spreadsheet_id: str, sheet_name: str, headers: list[str]) -> int:
-    rows = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"))
-    return sum(1 for row in rows if any(str(value).strip() for value in row))
+def clear_managed_rows(service, spreadsheet_id: str, sheet_name: str, headers: list[str], start_row: int = 2) -> None:
+    clear_width = len(headers) * 2
+    clear_values(service, spreadsheet_id, sheet_range(sheet_name, f"A{start_row}:{col_letter(clear_width)}"))
 
 
 def clear_values(service, spreadsheet_id: str, range_name: str) -> None:
@@ -520,45 +523,74 @@ def upsert_by_key(
     rows: list[dict[str, Any]],
 ) -> tuple[int, int, int]:
     ensure_sheet(service, spreadsheet_id, sheet_name, headers)
-    if not rows:
-        total_rows = data_row_count(service, spreadsheet_id, sheet_name, headers)
-        return 0, 0, total_rows
 
-    existing = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"))
+    existing = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers) * 2)}"))
     existing_keys: dict[str, int] = {}
-    mapping = header_map(service, spreadsheet_id, sheet_name, headers)
+    merged_values: list[list[Any]] = []
 
-    for row_index, row in enumerate(existing, start=2):
-        padded = pad_row(row, len(headers))
-        key = row_key({header: padded[mapping[header] - 1] for header in key_fields if header in mapping}, key_fields)
-        if key.strip(":"):
-            existing_keys[key] = row_index
+    for existing_row in existing:
+        values = normalize_existing_row(existing_row, headers, key_fields)
+        if not values:
+            continue
+        key = row_key_from_values(values, headers, key_fields)
+        if not key.strip(":"):
+            continue
+        if key in existing_keys:
+            merged_values[existing_keys[key]] = values
+            continue
+        existing_keys[key] = len(merged_values)
+        merged_values.append(values)
 
-    updates = []
-    appends = []
+    updated = 0
+    appended = 0
     for row in rows:
         values = [serialize_cell(row.get(header, "")) for header in headers]
         key = row_key(row, key_fields)
-        existing_row = existing_keys.get(key)
-        if existing_row:
-            updates.append(
-                {
-                    "range": sheet_range(sheet_name, f"A{existing_row}:{col_letter(len(headers))}{existing_row}"),
-                    "values": [values],
-                }
-            )
+        if not key.strip(":"):
+            continue
+        existing_index = existing_keys.get(key)
+        if existing_index is not None:
+            merged_values[existing_index] = values
+            updated += 1
         else:
-            appends.append(values)
+            existing_keys[key] = len(merged_values)
+            merged_values.append(values)
+            appended += 1
 
-    if updates:
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"valueInputOption": "RAW", "data": updates},
-        ).execute()
-    if appends:
-        append_values(service, spreadsheet_id, sheet_range(sheet_name, f"A:{col_letter(len(headers))}"), appends)
-    total_rows = data_row_count(service, spreadsheet_id, sheet_name, headers)
-    return len(updates), len(appends), total_rows
+    if merged_values:
+        update_values(
+            service,
+            spreadsheet_id,
+            sheet_range(sheet_name, f"A2:{col_letter(len(headers))}{len(merged_values) + 1}"),
+            merged_values,
+        )
+        clear_managed_rows(service, spreadsheet_id, sheet_name, headers, len(merged_values) + 2)
+    else:
+        clear_managed_rows(service, spreadsheet_id, sheet_name, headers)
+    return updated, appended, len(merged_values)
+
+
+def normalize_existing_row(row: list[Any], headers: list[str], key_fields: list[str]) -> list[Any] | None:
+    if not any(str(value).strip() for value in row):
+        return None
+
+    width = len(headers)
+    values = pad_row(row, width)[:width]
+    if row_key_from_values(values, headers, key_fields).strip(":"):
+        return values
+
+    max_shift = max(0, len(row) - 1)
+    for shift in range(1, max_shift + 1):
+        shifted = pad_row(row[shift : shift + width], width)
+        if row_key_from_values(shifted, headers, key_fields).strip(":"):
+            return shifted
+
+    return None
+
+
+def row_key_from_values(values: list[Any], headers: list[str], fields: list[str]) -> str:
+    header_index = {header: index for index, header in enumerate(headers)}
+    return ":".join(str(values[header_index[field]]) for field in fields if field in header_index)
 
 
 def serialize_cell(value: Any) -> Any:
