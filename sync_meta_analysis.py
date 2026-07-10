@@ -14,6 +14,12 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+POSTS_SHEET_NAME = "Posts/Ads"
+POST_COMMENTS_SHEET_NAME = "Post/Ad Comments"
+POST_SUMMARY_SHEET_NAME = "Post/Ad Summary"
+LEGACY_POSTS_SHEET_NAMES = ["Posts"]
+LEGACY_POST_COMMENTS_SHEET_NAMES = ["Post Comments"]
+LEGACY_POST_SUMMARY_SHEET_NAMES = ["Post Summary"]
 
 POST_HEADERS = [
     "post_id",
@@ -274,13 +280,54 @@ def clear_values(service, spreadsheet_id: str, range_name: str) -> None:
     service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=range_name, body={}).execute()
 
 
-def ensure_sheet(service, spreadsheet_id: str, title: str, headers: list[str]) -> None:
+def delete_legacy_sheets(service, spreadsheet_id: str, legacy_titles: list[str]) -> None:
+    metadata = get_spreadsheet(service, spreadsheet_id)
+    requests = []
+    for legacy_title in legacy_titles:
+        legacy_sheet = find_sheet(metadata, legacy_title)
+        if legacy_sheet:
+            requests.append({"deleteSheet": {"sheetId": legacy_sheet["sheetId"]}})
+    batch_update(service, spreadsheet_id, requests)
+
+
+def ensure_sheet(
+    service,
+    spreadsheet_id: str,
+    title: str,
+    headers: list[str],
+    legacy_titles: list[str] | None = None,
+) -> None:
     metadata = get_spreadsheet(service, spreadsheet_id)
     sheet = find_sheet(metadata, title)
+    if not sheet:
+        for legacy_title in legacy_titles or []:
+            legacy_sheet = find_sheet(metadata, legacy_title)
+            if legacy_sheet:
+                batch_update(
+                    service,
+                    spreadsheet_id,
+                    [
+                        {
+                            "updateSheetProperties": {
+                                "properties": {
+                                    "sheetId": legacy_sheet["sheetId"],
+                                    "title": title,
+                                },
+                                "fields": "title",
+                            }
+                        }
+                    ],
+                )
+                metadata = get_spreadsheet(service, spreadsheet_id)
+                sheet = find_sheet(metadata, title)
+                break
+
     if not sheet:
         batch_update(service, spreadsheet_id, [{"addSheet": {"properties": {"title": title}}}])
         metadata = get_spreadsheet(service, spreadsheet_id)
         sheet = find_sheet(metadata, title)
+
+    delete_legacy_sheets(service, spreadsheet_id, legacy_titles or [])
 
     current = get_values(service, spreadsheet_id, sheet_range(title, "1:1"))
     current_headers = [str(value).strip() for value in current[0]] if current else []
@@ -369,9 +416,9 @@ def default_cell_value(header: str) -> str:
 
 
 def ensure_schema(service, spreadsheet_id: str) -> None:
-    ensure_sheet(service, spreadsheet_id, "Posts", POST_HEADERS)
-    ensure_sheet(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS)
-    ensure_sheet(service, spreadsheet_id, "Post Summary", SUMMARY_HEADERS)
+    ensure_sheet(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, LEGACY_POSTS_SHEET_NAMES)
+    ensure_sheet(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, LEGACY_POST_COMMENTS_SHEET_NAMES)
+    ensure_sheet(service, spreadsheet_id, POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, LEGACY_POST_SUMMARY_SHEET_NAMES)
 
 
 def header_map(service, spreadsheet_id: str, sheet_name: str, headers: list[str]) -> dict[str, int]:
@@ -398,14 +445,14 @@ def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[st
 
 
 def existing_analyzed_post_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
-    ensure_sheet(service, spreadsheet_id, "Posts", POST_HEADERS)
-    mapping = header_map(service, spreadsheet_id, "Posts", POST_HEADERS)
+    ensure_sheet(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, LEGACY_POSTS_SHEET_NAMES)
+    mapping = header_map(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS)
     id_column = mapping.get("post_id")
     if not id_column:
         return set(), 0
 
     required_columns = ["post_sentiment", "post_emotions"]
-    rows = get_values(service, spreadsheet_id, sheet_range("Posts", f"A2:{col_letter(len(POST_HEADERS))}"))
+    rows = get_values(service, spreadsheet_id, sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"))
     analyzed_ids = set()
     missing_analysis_count = 0
     for row in rows:
@@ -426,15 +473,15 @@ def existing_analyzed_post_ids(service, spreadsheet_id: str) -> tuple[set[str], 
 
 
 def existing_analyzed_comment_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
-    ensure_sheet(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS)
-    mapping = header_map(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS)
+    ensure_sheet(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, LEGACY_POST_COMMENTS_SHEET_NAMES)
+    mapping = header_map(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS)
     id_column = mapping.get("comment_id")
     if not id_column:
         return set(), 0
 
     brand_column = mapping.get("is_brand_comment")
     audience_required_columns = ["comment_sentiment", "comment_emotions", "comment_stance", "comment_intent"]
-    rows = get_values(service, spreadsheet_id, sheet_range("Post Comments", f"A2:{col_letter(len(COMMENT_HEADERS))}"))
+    rows = get_values(service, spreadsheet_id, sheet_range(POST_COMMENTS_SHEET_NAME, f"A2:{col_letter(len(COMMENT_HEADERS))}"))
     analyzed_ids = set()
     missing_analysis_count = 0
     for row in rows:
@@ -1722,9 +1769,9 @@ def sync() -> None:
         analyze_comments(comments, posts)
 
     summaries = summarize_posts(posts, comments)
-    upsert_by_key(service, spreadsheet_id, "Posts", POST_HEADERS, ["post_id"], posts)
-    upsert_by_key(service, spreadsheet_id, "Post Comments", COMMENT_HEADERS, ["comment_id"], comments)
-    upsert_by_key(service, spreadsheet_id, "Post Summary", SUMMARY_HEADERS, ["post_id"], summaries)
+    upsert_by_key(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts)
+    upsert_by_key(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, ["comment_id"], comments)
+    upsert_by_key(service, spreadsheet_id, POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, ["post_id"], summaries)
     print(f"Synced {len(posts)} posts, {len(comments)} comments/replies, {len(summaries)} summaries.")
 
 
