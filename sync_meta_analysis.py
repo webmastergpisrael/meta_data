@@ -71,7 +71,6 @@ COMMENT_HEADERS = [
     "comment_intent",
     "is_sarcastic",
     "requires_response",
-    "response_priority",
     "response_value_score",
 ]
 
@@ -154,9 +153,6 @@ COMMENT_INTENTS = [
     "spam",
     "other",
 ]
-RESPONSE_PRIORITIES = ["none", "low", "medium", "high"]
-
-
 def env_value(name: str, default: str = "") -> str:
     return os.getenv(name) or default
 
@@ -193,7 +189,7 @@ CONFIG = {
     "max_paid_posts": env_int("MAX_PAID_POSTS", 0),
     "max_ads": env_int("MAX_ADS", 10),
     "max_comments_per_post": env_int("MAX_COMMENTS_PER_POST", 5),
-    "max_brand_comments_per_post": env_int("MAX_BRAND_COMMENTS_PER_POST", 0),
+    "max_brand_comments_per_post": env_int("MAX_BRAND_COMMENTS_PER_POST", 5),
     "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 1),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 3),
@@ -422,8 +418,6 @@ def default_cell_value(header: str) -> str:
         return "0"
     if header in {"is_sarcastic", "requires_response"}:
         return "FALSE"
-    if header == "response_priority":
-        return "none"
     return ""
 
 
@@ -1051,7 +1045,6 @@ def add_comment(
         "comment_intent": "other",
         "is_sarcastic": False,
         "requires_response": False,
-        "response_priority": "none",
         "response_value_score": 0.0,
     }
     row["is_brand_comment"] = is_greenpeace_comment(row, platform)
@@ -1075,8 +1068,30 @@ def clear_brand_comment_analysis(comment: dict[str, Any]) -> None:
     comment["comment_intent"] = ""
     comment["is_sarcastic"] = ""
     comment["requires_response"] = ""
-    comment["response_priority"] = ""
     comment["response_value_score"] = ""
+
+
+def clear_requires_response_for_answered_comments(comments: list[dict[str, Any]]) -> None:
+    """Do not request another response when Greenpeace already replied later in the thread."""
+    brand_reply_times_by_thread: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+    for comment in comments:
+        parent_id = str(comment.get("parent_comment_id") or "")
+        if not comment.get("is_brand_comment") or not parent_id:
+            continue
+        created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
+        if created_at:
+            brand_reply_times_by_thread[(str(comment.get("post_id") or ""), parent_id)].append(created_at)
+
+    for comment in comments:
+        if comment.get("is_brand_comment") or not comment.get("requires_response"):
+            continue
+        created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
+        if not created_at:
+            continue
+        thread_id = str(comment.get("parent_comment_id") or comment.get("comment_id") or "")
+        reply_times = brand_reply_times_by_thread.get((str(comment.get("post_id") or ""), thread_id), [])
+        if any(reply_time > created_at for reply_time in reply_times):
+            comment["requires_response"] = False
 
 
 def collect_visible_comments(
@@ -1670,7 +1685,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_intent": {"type": "STRING", "enum": COMMENT_INTENTS},
                         "is_sarcastic": {"type": "BOOLEAN"},
                         "requires_response": {"type": "BOOLEAN"},
-                        "response_priority": {"type": "STRING", "enum": RESPONSE_PRIORITIES},
                         "response_value_score": {"type": "NUMBER"},
                     },
                     "required": [
@@ -1682,7 +1696,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_intent",
                         "is_sarcastic",
                         "requires_response",
-                        "response_priority",
                         "response_value_score",
                     ],
                 },
@@ -1721,8 +1734,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             '"comment_sentiment":"positive|negative|mixed|neutral|unclear",'
             '"comment_stance":"supportive|opposed|skeptical|neutral|unclear",'
             '"comment_intent":"support|criticism|question|mockery|information_request|service_request|personal_story|tag_friend|political_attack|spam|other",'
-            '"is_sarcastic":false,"requires_response":false,"response_priority":"none|low|medium|high",'
-            '"response_value_score":0.0}]}. '
+            '"is_sarcastic":false,"requires_response":false,"response_value_score":0.0}]}. '
             "Use the closed lists exactly. "
             "Do not classify a comment as Neutral when it contains insults, accusations, mockery, sarcasm, "
             "conspiracy claims, hostile language, disgust, anxiety, sadness, or clear support. "
@@ -1738,7 +1750,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "Use service_request for donation, account, unsubscribe, billing, or operational support requests. "
             "requires_response should be true for good-faith questions, information requests, serious criticism, "
             "or safety/reputation issues. Brand comments are excluded; do not ask Greenpeace to respond to itself. "
-            "Use high priority only when immediate organizational response is important. "
             "Set response_value_score from 0.0 to 1.0 to estimate how much Greenpeace would benefit by replying publicly. "
             "Use 0.90-1.00 for comments where a reply can prevent reputational harm, correct serious misinformation, "
             "answer a high-value public question, de-escalate a visible conflict, or convert strong engagement into action. "
@@ -1746,7 +1757,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "could educate other readers. Use 0.40-0.69 for moderate engagement or ambiguous criticism where a reply may help but is not essential. "
             "Use 0.10-0.39 for low-value agreement, brief reactions, repetitive criticism, or comments unlikely to change audience perception. "
             "Use 0.00 for spam, tags, brand comments, or comments where replying has no clear organizational benefit. "
-            "This score is not the same as response_priority: response_priority is urgency, response_value_score is expected organizational benefit. "
             "Calibrate emotion_confidence: use 0.95 only when the emotion/stance is explicit and unambiguous, "
             "such as clear insults, strong praise, direct support, or direct hostility; use 0.85-0.90 when the classification is strong "
             "but depends on context or interpretation; use 0.65-0.80 for questions, short comments, sarcasm, mixed signals, "
@@ -1774,8 +1784,9 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             comment["comment_intent"] = allowed_value(item.get("comment_intent"), COMMENT_INTENTS, "other")
             comment["is_sarcastic"] = bool(item.get("is_sarcastic", False))
             comment["requires_response"] = bool(item.get("requires_response", False))
-            comment["response_priority"] = allowed_value(item.get("response_priority"), RESPONSE_PRIORITIES, "none")
             comment["response_value_score"] = bounded_float(item.get("response_value_score"), 0.0, 1.0)
+
+    clear_requires_response_for_answered_comments(comments)
 
 
 def allowed_value(value: Any, allowed: list[str], default: str) -> str:
