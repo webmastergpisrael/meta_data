@@ -35,8 +35,6 @@ on:
         description: "Gemini model to use"
         required: false
         default: "gemini-3.5-flash"
-  schedule:
-    - cron: "0 3 * * *"
 
 jobs:
   sync:
