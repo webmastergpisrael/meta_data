@@ -26,7 +26,7 @@ on:
       max_brand_comments_per_post:
         description: "How many organization comments to fetch per post/media/paid post"
         required: false
-        default: "0"
+        default: "5"
       lookback_days:
         description: "How many recent days to scan, counting back from today"
         required: false
@@ -35,6 +35,8 @@ on:
         description: "Gemini model to use"
         required: false
         default: "gemini-3.5-flash"
+  schedule:
+    - cron: "0 3 * * *"
 
 jobs:
   sync:
@@ -66,7 +68,7 @@ jobs:
           MAX_PAID_POSTS: ${{ github.event.inputs.max_paid_posts || vars.MAX_PAID_POSTS || '0' }}
           MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '10' }}
           MAX_COMMENTS_PER_POST: ${{ github.event.inputs.max_comments_per_post || vars.MAX_COMMENTS_PER_POST || '5' }}
-          MAX_BRAND_COMMENTS_PER_POST: ${{ github.event.inputs.max_brand_comments_per_post || vars.MAX_BRAND_COMMENTS_PER_POST || '0' }}
+          MAX_BRAND_COMMENTS_PER_POST: ${{ github.event.inputs.max_brand_comments_per_post || vars.MAX_BRAND_COMMENTS_PER_POST || '5' }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || vars.LOOKBACK_DAYS || '7' }}
           GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '1' }}
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
