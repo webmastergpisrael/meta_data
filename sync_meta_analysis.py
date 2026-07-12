@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 LEGACY_GEMINI_MODEL_UPGRADES = {
     "gemini-2.5-flash-lite": DEFAULT_GEMINI_MODEL,
 }
@@ -76,6 +76,14 @@ COMMENT_HEADERS = [
 
 SUMMARY_HEADERS = [
     "post_id",
+    "ad_id",
+    "campaign_name",
+    "post_url",
+    "canonical_topic",
+    "canonical_subtopic",
+    "collected_comment_count",
+    "collected_greenpeace_comment_count",
+    "collected_like_count",
     "total_comments",
     "requires_response_count",
     "requires_response_rate",
@@ -1828,6 +1836,14 @@ def summarize_posts(posts: list[dict[str, Any]], comments: list[dict[str, Any]])
         summaries.append(
             {
                 "post_id": post_id,
+                "ad_id": post.get("ad_id", ""),
+                "campaign_name": post.get("campaign_name", ""),
+                "post_url": post.get("post_url", ""),
+                "canonical_topic": post.get("canonical_topic", ""),
+                "canonical_subtopic": post.get("canonical_subtopic", ""),
+                "collected_comment_count": post.get("collected_comment_count", 0),
+                "collected_greenpeace_comment_count": post.get("collected_greenpeace_comment_count", 0),
+                "collected_like_count": post.get("collected_like_count", 0),
                 "total_comments": total,
                 "dominant_comment_stance": most_common(stance_counter, "unclear"),
                 "dominant_comment_intent": most_common(intent_counter, "other"),
