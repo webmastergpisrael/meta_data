@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 LEGACY_GEMINI_MODEL_UPGRADES = {
     "gemini-2.5-flash-lite": DEFAULT_GEMINI_MODEL,
 }
