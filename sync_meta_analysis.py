@@ -15,6 +15,7 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+RECOMMENDED_RESPONSE_SCORE_THRESHOLD = 0.70
 LEGACY_GEMINI_MODEL_UPGRADES = {
     "gemini-2.5-flash-lite": DEFAULT_GEMINI_MODEL,
 }
@@ -70,7 +71,6 @@ COMMENT_HEADERS = [
     "comment_stance",
     "comment_intent",
     "is_sarcastic",
-    "requires_response",
     "response_value_score",
 ]
 
@@ -167,7 +167,12 @@ def env_value(name: str, default: str = "") -> str:
 
 def env_int(name: str, default: int) -> int:
     value = env_value(name, str(default))
-    return int(value) if value else default
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a whole number") from exc
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -190,14 +195,9 @@ CONFIG = {
     "ig_user_id": "",
     "ad_account_id": "",
     "graph_version": env_value("META_GRAPH_VERSION", "v23.0"),
-    "lookback_days": env_int("LOOKBACK_DAYS", 7),
+    "lookback_days": env_int("LOOKBACK_DAYS", 30),
     "timezone": env_value("TIMEZONE", "UTC"),
-    "max_facebook_posts": env_int("MAX_FACEBOOK_POSTS", 1),
-    "max_instagram_media": env_int("MAX_INSTAGRAM_MEDIA", 1),
-    "max_paid_posts": env_int("MAX_PAID_POSTS", 0),
-    "max_ads": env_int("MAX_ADS", 10),
-    "max_comments_per_post": env_int("MAX_COMMENTS_PER_POST", 5),
-    "max_brand_comments_per_post": env_int("MAX_BRAND_COMMENTS_PER_POST", 5),
+    "max_comments_per_run": env_int("MAX_COMMENTS_PER_RUN", 500),
     "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 1),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 3),
@@ -277,6 +277,15 @@ def update_values(service, spreadsheet_id: str, range_name: str, values: list[li
         range=range_name,
         valueInputOption="RAW",
         body={"values": values},
+    ).execute()
+
+
+def batch_update_values(service, spreadsheet_id: str, updates: list[dict[str, Any]]) -> None:
+    if not updates:
+        return
+    service.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"valueInputOption": "RAW", "data": updates},
     ).execute()
 
 
@@ -394,6 +403,7 @@ def migrate_sheet_headers(
                 for header in desired_headers
             ]
         )
+    zero_answered_scores_in_rows(migrated, desired_headers)
 
     update_values(service, spreadsheet_id, sheet_range(sheet_name, f"A1:{col_letter(len(desired_headers))}1"), [desired_headers])
     if migrated:
@@ -405,6 +415,39 @@ def migrate_sheet_headers(
         )
     if width > len(desired_headers):
         clear_values(service, spreadsheet_id, sheet_range(sheet_name, f"{col_letter(len(desired_headers) + 1)}:{col_letter(width)}"))
+
+
+def zero_answered_scores_in_rows(rows: list[list[Any]], headers: list[str]) -> None:
+    required = {
+        "comment_id",
+        "post_id",
+        "parent_comment_id",
+        "comment_created_time",
+        "is_brand_comment",
+        "response_value_score",
+    }
+    if not required.issubset(headers):
+        return
+
+    index = {header: headers.index(header) for header in required}
+    brand_reply_times_by_thread: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+    for row in rows:
+        is_brand = str(row[index["is_brand_comment"]] or "").strip().lower() == "true"
+        parent_id = str(row[index["parent_comment_id"]] or "")
+        created_at = parse_meta_date(str(row[index["comment_created_time"]] or ""))
+        if is_brand and parent_id and created_at:
+            key = (str(row[index["post_id"]] or ""), parent_id)
+            brand_reply_times_by_thread[key].append(created_at)
+
+    for row in rows:
+        is_brand = str(row[index["is_brand_comment"]] or "").strip().lower() == "true"
+        created_at = parse_meta_date(str(row[index["comment_created_time"]] or ""))
+        if is_brand or not created_at:
+            continue
+        comment_id = str(row[index["comment_id"]] or "")
+        key = (str(row[index["post_id"]] or ""), comment_id)
+        if any(reply_time > created_at for reply_time in brand_reply_times_by_thread.get(key, [])):
+            row[index["response_value_score"]] = 0
 
 
 def default_cell_value(header: str) -> str:
@@ -424,7 +467,7 @@ def default_cell_value(header: str) -> str:
         return "0"
     if header == "response_value_score":
         return "0"
-    if header in {"is_sarcastic", "requires_response"}:
+    if header == "is_sarcastic":
         return "FALSE"
     return ""
 
@@ -456,68 +499,6 @@ def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[st
         if value:
             output.add(value)
     return output
-
-
-def existing_analyzed_post_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
-    ensure_sheet(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, LEGACY_POSTS_SHEET_NAMES)
-    mapping = header_map(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS)
-    id_column = mapping.get("post_id")
-    if not id_column:
-        return set(), 0
-
-    required_columns = ["post_sentiment", "post_emotions"]
-    rows = get_values(service, spreadsheet_id, sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"))
-    analyzed_ids = set()
-    missing_analysis_count = 0
-    for row in rows:
-        padded = pad_row(row, len(POST_HEADERS))
-        post_id = str(padded[id_column - 1] or "").strip()
-        if not post_id:
-            continue
-
-        has_new_analysis = all(
-            mapping.get(header) and str(padded[mapping[header] - 1] or "").strip()
-            for header in required_columns
-        )
-        if has_new_analysis:
-            analyzed_ids.add(post_id)
-        else:
-            missing_analysis_count += 1
-    return analyzed_ids, missing_analysis_count
-
-
-def existing_analyzed_comment_ids(service, spreadsheet_id: str) -> tuple[set[str], int]:
-    ensure_sheet(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, LEGACY_POST_COMMENTS_SHEET_NAMES)
-    mapping = header_map(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS)
-    id_column = mapping.get("comment_id")
-    if not id_column:
-        return set(), 0
-
-    brand_column = mapping.get("is_brand_comment")
-    audience_required_columns = ["comment_sentiment", "comment_emotions", "comment_stance", "comment_intent"]
-    rows = get_values(service, spreadsheet_id, sheet_range(POST_COMMENTS_SHEET_NAME, f"A2:{col_letter(len(COMMENT_HEADERS))}"))
-    analyzed_ids = set()
-    missing_analysis_count = 0
-    for row in rows:
-        padded = pad_row(row, len(COMMENT_HEADERS))
-        comment_id = str(padded[id_column - 1] or "").strip()
-        if not comment_id:
-            continue
-
-        if not brand_column:
-            missing_analysis_count += 1
-            continue
-
-        is_brand = str(padded[brand_column - 1] or "").strip().lower() == "true"
-        has_new_analysis = is_brand or all(
-            mapping.get(header) and str(padded[mapping[header] - 1] or "").strip()
-            for header in audience_required_columns
-        )
-        if has_new_analysis:
-            analyzed_ids.add(comment_id)
-        else:
-            missing_analysis_count += 1
-    return analyzed_ids, missing_analysis_count
 
 
 def upsert_by_key(
@@ -574,6 +555,43 @@ def upsert_by_key(
     else:
         clear_managed_rows(service, spreadsheet_id, sheet_name, headers)
     return updated, appended, len(merged_values)
+
+
+def append_new_rows(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    headers: list[str],
+    key_fields: list[str],
+    rows: list[dict[str, Any]],
+) -> tuple[int, int, int]:
+    ensure_sheet(service, spreadsheet_id, sheet_name, headers)
+    existing = get_values(service, spreadsheet_id, sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"))
+    existing_keys = {
+        row_key_from_values(pad_row(row, len(headers)), headers, key_fields)
+        for row in existing
+        if row_key_from_values(pad_row(row, len(headers)), headers, key_fields).strip(":")
+    }
+    additions: list[list[Any]] = []
+    for row in rows:
+        key = row_key(row, key_fields)
+        if not key.strip(":") or key in existing_keys:
+            continue
+        existing_keys.add(key)
+        additions.append([serialize_cell(row.get(header, "")) for header in headers])
+
+    if additions:
+        start_row = len(existing) + 2
+        update_values(
+            service,
+            spreadsheet_id,
+            sheet_range(
+                sheet_name,
+                f"A{start_row}:{col_letter(len(headers))}{start_row + len(additions) - 1}",
+            ),
+            additions,
+        )
+    return 0, len(additions), len(existing_keys)
 
 
 def normalize_existing_row(row: list[Any], headers: list[str], key_fields: list[str]) -> list[Any] | None:
@@ -687,7 +705,9 @@ def configured_timezone():
 
 def collection_window() -> tuple[datetime, datetime]:
     local_tz = configured_timezone()
-    lookback_days = max(1, CONFIG["lookback_days"])
+    lookback_days = CONFIG["lookback_days"]
+    if lookback_days < 1:
+        raise RuntimeError("LOOKBACK_DAYS must be at least 1")
     end_date = datetime.now(local_tz)
     start_date = end_date - timedelta(days=lookback_days)
     return start_date.astimezone(timezone.utc), end_date.astimezone(timezone.utc)
@@ -765,7 +785,7 @@ def discover_meta_context(access_token: str) -> dict[str, str]:
             context["ig_user_id"] = context["ig_user_id"] or str(instagram.get("id") or "")
             context["instagram_username"] = context["instagram_username"] or str(instagram.get("username") or "")
 
-    if not context["ad_account_id"] and CONFIG["max_ads"] > 0 and CONFIG["max_paid_posts"] > 0:
+    if not context["ad_account_id"]:
         ad_accounts = fetch_json(
             graph_url(
                 "/me/adaccounts",
@@ -796,7 +816,7 @@ def facebook_post_fields(comment_since: datetime, until: datetime) -> str:
 
 
 def fetch_facebook_posts(page_id: str, post_since: datetime, until: datetime, comment_since: datetime, access_token: str):
-    if not page_id or CONFIG["max_facebook_posts"] <= 0:
+    if not page_id:
         return []
     return get_all_pages(
         f"/{page_id}/feed",
@@ -804,15 +824,15 @@ def fetch_facebook_posts(page_id: str, post_since: datetime, until: datetime, co
             "fields": facebook_post_fields(comment_since, until),
             "since": to_unix(post_since),
             "until": to_unix(until),
-            "limit": CONFIG["max_facebook_posts"],
+            "limit": 100,
         },
         access_token,
-        CONFIG["max_facebook_posts"],
+        0,
     )
 
 
 def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: datetime, access_token: str):
-    if not ig_user_id or CONFIG["max_instagram_media"] <= 0:
+    if not ig_user_id:
         return []
     fields = ",".join(
         [
@@ -827,9 +847,9 @@ def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: dat
     )
     media = get_all_pages(
         f"/{ig_user_id}/media",
-        {"fields": fields, "since": to_unix(since_date), "until": to_unix(until_date), "limit": CONFIG["max_instagram_media"]},
+        {"fields": fields, "since": to_unix(since_date), "until": to_unix(until_date), "limit": 100},
         access_token,
-        CONFIG["max_instagram_media"],
+        0,
     )
     return [item for item in media if is_within(item.get("timestamp", ""), since_date, until_date)]
 
@@ -839,27 +859,38 @@ def fetch_facebook_comments_with_replies(
     since_date: datetime,
     until_date: datetime,
     access_token: str,
-    max_comments: int,
 ):
-    if max_comments <= 0:
-        return []
-    page_limit = meta_page_limit(max_comments)
-    replies = f"comments.limit({page_limit}){{{FACEBOOK_COMMENT_FIELDS}}}"
-    fields = f"{FACEBOOK_COMMENT_FIELDS},{replies}"
     comments = get_all_pages(
         f"/{object_id}/comments",
         {
-            "fields": fields,
-            "filter": "stream",
+            "fields": FACEBOOK_COMMENT_FIELDS,
+            "filter": "toplevel",
             "order": "chronological",
             "since": to_unix(since_date),
             "until": to_unix(until_date),
-            "limit": page_limit,
+            "limit": 100,
         },
         access_token,
-        max_comments,
+        0,
     )
-    return [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
+    comments = [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
+    for comment in comments:
+        replies = get_all_pages(
+            f"/{comment.get('id', '')}/comments",
+            {
+                "fields": FACEBOOK_COMMENT_FIELDS,
+                "order": "chronological",
+                "since": to_unix(since_date),
+                "until": to_unix(until_date),
+                "limit": 100,
+            },
+            access_token,
+            0,
+        )
+        comment["comments"] = {
+            "data": [reply for reply in replies if is_within(reply.get("created_time", ""), since_date, until_date)]
+        }
+    return comments
 
 
 def fetch_instagram_comments(
@@ -867,34 +898,40 @@ def fetch_instagram_comments(
     since_date: datetime,
     until_date: datetime,
     access_token: str,
-    max_comments: int,
 ):
-    if max_comments <= 0:
-        return []
-    page_limit = meta_page_limit(max_comments)
-    replies = f"replies.limit({page_limit}){{id,text,timestamp,username,like_count}}"
-    fields = f"id,text,timestamp,username,like_count,{replies}"
     comments = get_all_pages(
         f"/{media_id}/comments",
-        {"fields": fields, "limit": page_limit},
+        {"fields": "id,text,timestamp,username,like_count", "limit": 100},
         access_token,
-        max_comments,
+        0,
     )
-    return [comment for comment in comments if is_within(comment.get("timestamp", ""), since_date, until_date)]
+    comments = [comment for comment in comments if is_within(comment.get("timestamp", ""), since_date, until_date)]
+    for comment in comments:
+        replies = get_all_pages(
+            f"/{comment.get('id', '')}/replies",
+            {"fields": "id,text,timestamp,username,like_count", "limit": 100},
+            access_token,
+            0,
+        )
+        comment["replies"] = {
+            "data": [reply for reply in replies if is_within(reply.get("timestamp", ""), since_date, until_date)]
+        }
+    return comments
 
 
-def fetch_ads(ad_account_id: str, access_token: str):
-    if not ad_account_id or CONFIG["max_ads"] <= 0 or CONFIG["max_paid_posts"] <= 0:
+def fetch_ads(ad_account_id: str, since_date: datetime, until_date: datetime, access_token: str):
+    if not ad_account_id:
         return []
-    return get_all_pages(
+    ads = get_all_pages(
         f"/{ad_account_id}/ads",
         {
-            "fields": "id,name,campaign{name},creative{id,effective_object_story_id,effective_instagram_media_id}",
-            "limit": CONFIG["max_ads"],
+            "fields": "id,name,created_time,campaign{name},creative{id,effective_object_story_id,effective_instagram_media_id}",
+            "limit": 100,
         },
         access_token,
-        CONFIG["max_ads"],
+        0,
     )
+    return [ad for ad in ads if is_within(ad.get("created_time", ""), since_date, until_date)]
 
 
 def fetch_facebook_object(object_id: str, access_token: str):
@@ -909,57 +946,12 @@ def fetch_facebook_object(object_id: str, access_token: str):
     )
 
 
-def fetch_facebook_comments(
-    object_id: str,
-    since_date: datetime,
-    until_date: datetime,
-    access_token: str,
-    max_comments: int,
-):
-    if max_comments <= 0:
-        return []
-    page_limit = meta_page_limit(max_comments)
-    comments = get_all_pages(
-        f"/{object_id}/comments",
-        {
-            "fields": FACEBOOK_COMMENT_FIELDS,
-            "filter": "stream",
-            "order": "chronological",
-            "since": to_unix(since_date),
-            "until": to_unix(until_date),
-            "limit": page_limit,
-        },
-        access_token,
-        max_comments,
-    )
-    return [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
-
-
-def fetch_instagram_media_by_id(media_id: str, access_token: str, max_comments: int):
-    if max_comments <= 0:
-        return fetch_json(
-            graph_url(
-                f"/{media_id}",
-                {
-                    "fields": "id,caption,timestamp,permalink,media_type,like_count,comments_count"
-                },
-                access_token,
-            )
-        )
-    page_limit = meta_page_limit(max_comments)
-    replies = (
-        f"replies.limit({page_limit})"
-        "{id,text,timestamp,username,like_count}"
-    )
-    comments = (
-        f"comments.limit({page_limit})"
-        f"{{id,text,timestamp,username,like_count,{replies}}}"
-    )
+def fetch_instagram_media_by_id(media_id: str, access_token: str):
     return fetch_json(
         graph_url(
             f"/{media_id}",
             {
-                "fields": f"id,caption,timestamp,permalink,media_type,like_count,comments_count,{comments}"
+                "fields": "id,caption,timestamp,permalink,media_type,like_count,comments_count"
             },
             access_token,
         )
@@ -1052,20 +1044,11 @@ def add_comment(
         "comment_stance": "unclear",
         "comment_intent": "other",
         "is_sarcastic": False,
-        "requires_response": False,
         "response_value_score": 0.0,
     }
     row["is_brand_comment"] = is_greenpeace_comment(row, platform)
     comments.append(row)
     return row
-
-
-def remove_last_added_comment(comments: list[dict[str, Any]], seen: set[str], row: dict[str, Any]) -> None:
-    if comments and comments[-1].get("comment_id") == row.get("comment_id"):
-        comments.pop()
-    else:
-        comments[:] = [comment for comment in comments if comment.get("comment_id") != row.get("comment_id")]
-    seen.discard(str(row.get("comment_id") or ""))
 
 
 def clear_brand_comment_analysis(comment: dict[str, Any]) -> None:
@@ -1075,12 +1058,11 @@ def clear_brand_comment_analysis(comment: dict[str, Any]) -> None:
     comment["comment_stance"] = ""
     comment["comment_intent"] = ""
     comment["is_sarcastic"] = ""
-    comment["requires_response"] = ""
     comment["response_value_score"] = ""
 
 
-def clear_requires_response_for_answered_comments(comments: list[dict[str, Any]]) -> None:
-    """Do not request another response when Greenpeace already replied later in the thread."""
+def zero_response_scores_for_answered_comments(comments: list[dict[str, Any]]) -> None:
+    """An already answered comment has no remaining response value."""
     brand_reply_times_by_thread: dict[tuple[str, str], list[datetime]] = defaultdict(list)
     for comment in comments:
         parent_id = str(comment.get("parent_comment_id") or "")
@@ -1091,15 +1073,15 @@ def clear_requires_response_for_answered_comments(comments: list[dict[str, Any]]
             brand_reply_times_by_thread[(str(comment.get("post_id") or ""), parent_id)].append(created_at)
 
     for comment in comments:
-        if comment.get("is_brand_comment") or not comment.get("requires_response"):
+        if comment.get("is_brand_comment"):
             continue
         created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
         if not created_at:
             continue
-        thread_id = str(comment.get("parent_comment_id") or comment.get("comment_id") or "")
-        reply_times = brand_reply_times_by_thread.get((str(comment.get("post_id") or ""), thread_id), [])
+        comment_id = str(comment.get("comment_id") or "")
+        reply_times = brand_reply_times_by_thread.get((str(comment.get("post_id") or ""), comment_id), [])
         if any(reply_time > created_at for reply_time in reply_times):
-            comment["requires_response"] = False
+            comment["response_value_score"] = 0.0
 
 
 def collect_visible_comments(
@@ -1111,36 +1093,15 @@ def collect_visible_comments(
     post_url: str,
     since_date: datetime,
     until_date: datetime,
-    max_audience_comments: int,
-    max_brand_comments: int,
 ) -> None:
-    audience_collected = 0
-    brand_collected = 0
     date_field = "created_time" if platform == "facebook" else "timestamp"
     replies_field = "comments" if platform == "facebook" else "replies"
 
-    def limits_reached() -> bool:
-        return audience_collected >= max_audience_comments and brand_collected >= max_brand_comments
-
     def keep_added_comment(row: dict[str, Any] | None) -> None:
-        nonlocal audience_collected, brand_collected
-        if not row:
-            return
-        if row.get("is_brand_comment"):
-            if brand_collected >= max_brand_comments:
-                remove_last_added_comment(comments, seen, row)
-                return
-            brand_collected += 1
+        if row and row.get("is_brand_comment"):
             clear_brand_comment_analysis(row)
-            return
-        if audience_collected >= max_audience_comments:
-            remove_last_added_comment(comments, seen, row)
-            return
-        audience_collected += 1
 
     for comment in raw_comments:
-        if limits_reached():
-            break
         if is_within(comment.get(date_field, ""), since_date, until_date):
             keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", "", post_url))
 
@@ -1150,8 +1111,6 @@ def collect_visible_comments(
             key=lambda item: meta_date_sort_key(item, date_field),
         )
         for reply in replies:
-            if limits_reached():
-                break
             if not is_within(reply.get(date_field, ""), since_date, until_date):
                 continue
             keep_added_comment(
@@ -1169,10 +1128,22 @@ def collect_visible_comments(
             previous_message = comment_text(reply, platform)
 
 
+def select_oldest_comments(comments: list[dict[str, Any]], max_comments: int) -> list[dict[str, Any]]:
+    if max_comments < 1:
+        raise RuntimeError("MAX_COMMENTS_PER_RUN must be at least 1")
+    comments.sort(
+        key=lambda comment: (
+            meta_date_sort_key(comment, "comment_created_time"),
+            str(comment.get("comment_id") or ""),
+        )
+    )
+    return comments[:max_comments]
+
+
 def collect_rows(
     existing_post_ids: set[str] | None = None,
     existing_comment_ids: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     existing_post_ids = existing_post_ids or set()
     existing_comment_ids = existing_comment_ids or set()
     access_token = meta_access_token()
@@ -1182,32 +1153,38 @@ def collect_rows(
 
     posts: list[dict[str, Any]] = []
     comments: list[dict[str, Any]] = []
+    scanned_posts: dict[str, dict[str, Any]] = {}
+    scanned_content_ids: set[str] = set()
+    new_post_ids: set[str] = set()
     seen_comments: set[str] = set(existing_comment_ids)
-    audience_comment_limit = max(0, CONFIG["max_comments_per_post"])
-    brand_comment_limit = max(0, CONFIG["max_brand_comments_per_post"])
-    fetch_comment_limit = comment_fetch_limit(audience_comment_limit, brand_comment_limit)
+    max_comments = CONFIG["max_comments_per_run"]
+
+    def register_post(post_row: dict[str, Any]) -> None:
+        post_id = str(post_row.get("post_id") or "")
+        if not post_id:
+            return
+        scanned_posts[post_id] = post_row
+        if post_id not in existing_post_ids and post_id not in new_post_ids:
+            posts.append(post_row)
+            new_post_ids.add(post_id)
 
     for post in fetch_facebook_posts(meta_context["page_id"], window_start, window_end, window_start, page_token):
         post_id = post.get("id", "")
-        if not post_id or post_id in existing_post_ids:
+        if not post_id:
             continue
-
-        if fetch_comment_limit > 0:
-            post_comments = fetch_facebook_comments_with_replies(post_id, window_start, window_end, page_token, fetch_comment_limit)
-            collect_visible_comments(
-                comments,
-                seen_comments,
-                "facebook",
-                post_id,
-                post_comments,
-                post.get("permalink_url", ""),
-                window_start,
-                window_end,
-                audience_comment_limit,
-                brand_comment_limit,
-            )
-
-        posts.append(
+        scanned_content_ids.add(post_id)
+        post_comments = fetch_facebook_comments_with_replies(post_id, window_start, window_end, page_token)
+        collect_visible_comments(
+            comments,
+            seen_comments,
+            "facebook",
+            post_id,
+            post_comments,
+            post.get("permalink_url", ""),
+            window_start,
+            window_end,
+        )
+        register_post(
             make_post_row(
                 post_id=post_id,
                 platform="facebook",
@@ -1227,25 +1204,21 @@ def collect_rows(
 
     for media in fetch_instagram_media(meta_context["ig_user_id"], window_start, window_end, access_token):
         post_id = media.get("id", "")
-        if not post_id or post_id in existing_post_ids:
+        if not post_id:
             continue
-
-        if fetch_comment_limit > 0:
-            post_comments = fetch_instagram_comments(post_id, window_start, window_end, access_token, fetch_comment_limit)
-            collect_visible_comments(
-                comments,
-                seen_comments,
-                "instagram",
-                post_id,
-                post_comments,
-                media.get("permalink", ""),
-                window_start,
-                window_end,
-                audience_comment_limit,
-                brand_comment_limit,
-            )
-
-        posts.append(
+        scanned_content_ids.add(post_id)
+        post_comments = fetch_instagram_comments(post_id, window_start, window_end, access_token)
+        collect_visible_comments(
+            comments,
+            seen_comments,
+            "instagram",
+            post_id,
+            post_comments,
+            media.get("permalink", ""),
+            window_start,
+            window_end,
+        )
+        register_post(
             make_post_row(
                 post_id=post_id,
                 platform="instagram",
@@ -1263,39 +1236,33 @@ def collect_rows(
             )
         )
 
-    paid_posts = 0
-    for ad in fetch_ads(meta_context["ad_account_id"], access_token):
-        if paid_posts >= CONFIG["max_paid_posts"]:
-            break
+    for ad in fetch_ads(meta_context["ad_account_id"], window_start, window_end, access_token):
         creative = ad.get("creative", {})
         campaign_name = ad.get("campaign", {}).get("name", "")
         ad_id = ad.get("id", "")
         if creative.get("effective_object_story_id"):
             object_id = creative["effective_object_story_id"]
-            if object_id not in existing_post_ids:
+            if object_id not in scanned_content_ids:
+                scanned_content_ids.add(object_id)
                 ad_post = fetch_facebook_object(object_id, page_token)
                 if is_within(ad_post.get("created_time", ""), window_start, window_end):
-                    if fetch_comment_limit > 0:
-                        ad_comments = fetch_facebook_comments_with_replies(
-                            object_id,
-                            window_start,
-                            window_end,
-                            page_token,
-                            fetch_comment_limit,
-                        )
-                        collect_visible_comments(
-                            comments,
-                            seen_comments,
-                            "facebook",
-                            object_id,
-                            ad_comments,
-                            ad_post.get("permalink_url", ""),
-                            window_start,
-                            window_end,
-                            audience_comment_limit,
-                            brand_comment_limit,
-                        )
-                    posts.append(
+                    ad_comments = fetch_facebook_comments_with_replies(
+                        object_id,
+                        window_start,
+                        window_end,
+                        page_token,
+                    )
+                    collect_visible_comments(
+                        comments,
+                        seen_comments,
+                        "facebook",
+                        object_id,
+                        ad_comments,
+                        ad_post.get("permalink_url", ""),
+                        window_start,
+                        window_end,
+                    )
+                    register_post(
                         make_post_row(
                             post_id=object_id,
                             platform="facebook",
@@ -1312,28 +1279,24 @@ def collect_rows(
                             comments=[comment for comment in comments if comment["post_id"] == object_id],
                         )
                     )
-                    paid_posts += 1
-        if paid_posts >= CONFIG["max_paid_posts"]:
-            break
         if creative.get("effective_instagram_media_id"):
             media_id = creative["effective_instagram_media_id"]
-            if media_id not in existing_post_ids:
-                ad_media = fetch_instagram_media_by_id(media_id, access_token, fetch_comment_limit)
+            if media_id not in scanned_content_ids:
+                scanned_content_ids.add(media_id)
+                ad_media = fetch_instagram_media_by_id(media_id, access_token)
                 if is_within(ad_media.get("timestamp", ""), window_start, window_end):
-                    if fetch_comment_limit > 0:
-                        collect_visible_comments(
-                            comments,
-                            seen_comments,
-                            "instagram",
-                            media_id,
-                            ad_media.get("comments", {}).get("data", []),
-                            ad_media.get("permalink", ""),
-                            window_start,
-                            window_end,
-                            audience_comment_limit,
-                            brand_comment_limit,
-                        )
-                    posts.append(
+                    ad_comments = fetch_instagram_comments(media_id, window_start, window_end, access_token)
+                    collect_visible_comments(
+                        comments,
+                        seen_comments,
+                        "instagram",
+                        media_id,
+                        ad_comments,
+                        ad_media.get("permalink", ""),
+                        window_start,
+                        window_end,
+                    )
+                    register_post(
                         make_post_row(
                             post_id=media_id,
                             platform="instagram",
@@ -1350,17 +1313,15 @@ def collect_rows(
                             comments=[comment for comment in comments if comment["post_id"] == media_id],
                         )
                     )
-                    paid_posts += 1
-
-    return posts, comments
-
-
-def comment_fetch_limit(audience_comment_limit: int, brand_comment_limit: int) -> int:
-    requested_limit = audience_comment_limit + brand_comment_limit
-    if requested_limit <= 0:
-        return 0
-    buffer = min(max(audience_comment_limit, brand_comment_limit, 5), 20)
-    return requested_limit + buffer
+    candidate_count = len(comments)
+    selected_comments = select_oldest_comments(comments, max_comments)
+    deferred_count = candidate_count - len(selected_comments)
+    print(
+        "New comment candidates: "
+        f"found={candidate_count}, selected={len(selected_comments)}, deferred={deferred_count}, "
+        f"limit={max_comments}."
+    )
+    return posts, selected_comments, list(scanned_posts.values())
 
 
 def make_post_row(
@@ -1551,7 +1512,7 @@ def parse_first_json_object(text: str) -> dict[str, Any]:
 def gemini_response_shape(data: dict[str, Any]) -> str:
     if not isinstance(data, dict):
         return type(data).__name__
-    shape = {key: type(value).__name__ for key, value in data.items()}
+    shape: dict[str, Any] = {key: type(value).__name__ for key, value in data.items()}
     if data.get("output") and isinstance(data["output"], list):
         shape["output_types"] = [
             output.get("type", type(output).__name__)
@@ -1692,7 +1653,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_stance": {"type": "STRING", "enum": COMMENT_STANCES},
                         "comment_intent": {"type": "STRING", "enum": COMMENT_INTENTS},
                         "is_sarcastic": {"type": "BOOLEAN"},
-                        "requires_response": {"type": "BOOLEAN"},
                         "response_value_score": {"type": "NUMBER"},
                     },
                     "required": [
@@ -1703,7 +1663,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_stance",
                         "comment_intent",
                         "is_sarcastic",
-                        "requires_response",
                         "response_value_score",
                     ],
                 },
@@ -1742,7 +1701,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             '"comment_sentiment":"positive|negative|mixed|neutral|unclear",'
             '"comment_stance":"supportive|opposed|skeptical|neutral|unclear",'
             '"comment_intent":"support|criticism|question|mockery|information_request|service_request|personal_story|tag_friend|political_attack|spam|other",'
-            '"is_sarcastic":false,"requires_response":false,"response_value_score":0.0}]}. '
+            '"is_sarcastic":false,"response_value_score":0.0}]}. '
             "Use the closed lists exactly. "
             "Do not classify a comment as Neutral when it contains insults, accusations, mockery, sarcasm, "
             "conspiracy claims, hostile language, disgust, anxiety, sadness, or clear support. "
@@ -1756,8 +1715,6 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "and Neutral only for emotionally flat logistics, tags, simple facts, or unclear minimal text. "
             "Crying or sad emoji-only comments should use Sadness or Concern, not Neutral. "
             "Use service_request for donation, account, unsubscribe, billing, or operational support requests. "
-            "requires_response should be true for good-faith questions, information requests, serious criticism, "
-            "or safety/reputation issues. Brand comments are excluded; do not ask Greenpeace to respond to itself. "
             "Set response_value_score from 0.0 to 1.0 to estimate how much Greenpeace would benefit by replying publicly. "
             "Use 0.90-1.00 for comments where a reply can prevent reputational harm, correct serious misinformation, "
             "answer a high-value public question, de-escalate a visible conflict, or convert strong engagement into action. "
@@ -1775,7 +1732,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "Examples:\n"
             '- "יאללה שקרנים הביתה" => emotions ["Anger","Hostility"], sentiment negative, stance opposed, intent criticism.\n'
             '- "בבקשה תחליטו.. או אבולה או חייזרים" => emotions ["Contempt"], sentiment negative, stance skeptical, intent mockery, is_sarcastic true.\n'
-            '- "איפה חותמים?" => emotions ["Agreement"], sentiment positive, stance supportive, intent information_request, requires_response true.\n'
+            '- "איפה חותמים?" => emotions ["Agreement"], sentiment positive, stance supportive, intent information_request, response_value_score 0.70-0.89.\n'
             '- "🔥🔥🥵😣" on a climate disaster post => emotions ["Concern","Anxiety"], sentiment mixed, stance supportive.\n'
             '- "@friend" or only tagging a friend => emotions ["Neutral"], sentiment neutral, intent tag_friend.\n\n'
             f"Comments:\n{json.dumps(items, ensure_ascii=False)}"
@@ -1791,10 +1748,9 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             comment["comment_stance"] = allowed_value(item.get("comment_stance"), COMMENT_STANCES, "unclear")
             comment["comment_intent"] = allowed_value(item.get("comment_intent"), COMMENT_INTENTS, "other")
             comment["is_sarcastic"] = bool(item.get("is_sarcastic", False))
-            comment["requires_response"] = bool(item.get("requires_response", False))
             comment["response_value_score"] = bounded_float(item.get("response_value_score"), 0.0, 1.0)
 
-    clear_requires_response_for_answered_comments(comments)
+    zero_response_scores_for_answered_comments(comments)
 
 
 def allowed_value(value: Any, allowed: list[str], default: str) -> str:
@@ -1817,6 +1773,13 @@ def bounded_float(value: Any, minimum: float, maximum: float) -> float:
     return min(max(parsed, minimum), maximum)
 
 
+def response_score(comment: dict[str, Any]) -> float:
+    try:
+        return float(comment.get("response_value_score") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def summarize_posts(posts: list[dict[str, Any]], comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     comments_by_post: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for comment in comments:
@@ -1831,7 +1794,11 @@ def summarize_posts(posts: list[dict[str, Any]], comments: list[dict[str, Any]])
         total = len(post_comments)
         stance_counter = Counter(comment.get("comment_stance", "unclear") for comment in post_comments)
         intent_counter = Counter(comment.get("comment_intent", "other") for comment in post_comments)
-        requires_response_count = sum(1 for comment in post_comments if comment.get("requires_response"))
+        requires_response_count = sum(
+            1
+            for comment in post_comments
+            if response_score(comment) >= RECOMMENDED_RESPONSE_SCORE_THRESHOLD
+        )
 
         summaries.append(
             {
@@ -1871,50 +1838,146 @@ def rate(count: int, total: int) -> float:
     return round(count / total, 4) if total else 0.0
 
 
+def reconcile_answered_response_scores(service, spreadsheet_id: str) -> int:
+    raw_rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POST_COMMENTS_SHEET_NAME, f"A2:{col_letter(len(COMMENT_HEADERS))}"),
+    )
+    if not raw_rows:
+        return 0
+    rows = [pad_row(row, len(COMMENT_HEADERS)) for row in raw_rows]
+    score_index = COMMENT_HEADERS.index("response_value_score")
+    previous_scores = [row[score_index] for row in rows]
+    zero_answered_scores_in_rows(rows, COMMENT_HEADERS)
+    changed = 0
+    updates: list[dict[str, Any]] = []
+    score_column = score_index + 1
+    for row_offset, (previous, row) in enumerate(zip(previous_scores, rows), start=2):
+        try:
+            previous_score = float(previous or 0)
+        except (TypeError, ValueError):
+            previous_score = 0.0
+        if previous_score != 0.0 and row[score_index] == 0:
+            changed += 1
+            cell = f"{col_letter(score_column)}{row_offset}"
+            updates.append(
+                {
+                    "range": sheet_range(POST_COMMENTS_SHEET_NAME, cell),
+                    "values": [[0]],
+                }
+            )
+    batch_update_values(service, spreadsheet_id, updates)
+    return changed
+
+
+def refresh_derived_metrics(service, spreadsheet_id: str) -> tuple[int, int]:
+    raw_comment_rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POST_COMMENTS_SHEET_NAME, f"A2:{col_letter(len(COMMENT_HEADERS))}"),
+    )
+    comments: list[dict[str, Any]] = []
+    comments_by_post: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for raw_row in raw_comment_rows:
+        row = pad_row(raw_row, len(COMMENT_HEADERS))
+        comment = {header: row[index] for index, header in enumerate(COMMENT_HEADERS)}
+        comment["is_brand_comment"] = str(comment.get("is_brand_comment") or "").strip().lower() == "true"
+        comments.append(comment)
+        comments_by_post[str(comment.get("post_id") or "")].append(comment)
+
+    raw_post_rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"),
+    )
+    if not raw_post_rows:
+        return 0, 0
+    posts: list[dict[str, Any]] = []
+    count_values: list[list[int]] = []
+    for raw_row in raw_post_rows:
+        row = pad_row(raw_row, len(POST_HEADERS))
+        post = {header: row[index] for index, header in enumerate(POST_HEADERS)}
+        post_comments = comments_by_post.get(str(post.get("post_id") or ""), [])
+        total_count = len(post_comments)
+        brand_count = sum(1 for comment in post_comments if comment.get("is_brand_comment"))
+        reply_count = sum(1 for comment in post_comments if comment.get("parent_comment_id"))
+        post["collected_comment_count"] = total_count
+        post["collected_greenpeace_comment_count"] = brand_count
+        post["collected_reply_count"] = reply_count
+        posts.append(post)
+        count_values.append([total_count, brand_count, reply_count])
+
+    first_count_column = POST_HEADERS.index("collected_comment_count") + 1
+    last_count_column = POST_HEADERS.index("collected_reply_count") + 1
+    update_values(
+        service,
+        spreadsheet_id,
+        sheet_range(
+            POSTS_SHEET_NAME,
+            f"{col_letter(first_count_column)}2:{col_letter(last_count_column)}{len(count_values) + 1}",
+        ),
+        count_values,
+    )
+    summaries = summarize_posts(posts, comments)
+    _, _, summary_total = upsert_by_key(
+        service,
+        spreadsheet_id,
+        POST_SUMMARY_SHEET_NAME,
+        SUMMARY_HEADERS,
+        ["post_id"],
+        summaries,
+    )
+    return len(posts), summary_total
+
+
 def sync() -> None:
     spreadsheet_id = required_env("SPREADSHEET_ID")
     service = get_sheets_service()
     ensure_schema(service, spreadsheet_id)
     print(f"Writing to Google Sheets spreadsheet: {spreadsheet_id}")
 
-    known_post_ids, missing_post_analysis_count = existing_analyzed_post_ids(service, spreadsheet_id)
-    known_comment_ids, missing_comment_analysis_count = existing_analyzed_comment_ids(service, spreadsheet_id)
-    if missing_post_analysis_count:
-        print(
-            f"Found {missing_post_analysis_count} existing posts without the new analysis columns. "
-            "Rechecking posts in the selected date window."
-        )
-    if missing_comment_analysis_count:
-        print(
-            f"Found {missing_comment_analysis_count} existing comments without the new analysis columns. "
-            "Rechecking posts in the selected date window."
-        )
-        known_post_ids = set()
+    known_post_ids = existing_ids(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, "post_id")
+    known_comment_ids = existing_ids(
+        service,
+        spreadsheet_id,
+        POST_COMMENTS_SHEET_NAME,
+        COMMENT_HEADERS,
+        "comment_id",
+    )
     print(f"Found {len(known_post_ids)} existing posts and {len(known_comment_ids)} existing comments in Google Sheets.")
 
-    posts, comments = collect_rows(known_post_ids, known_comment_ids)
+    posts, comments, scanned_posts = collect_rows(known_post_ids, known_comment_ids)
     if env_bool("ANALYZE_WITH_GEMINI", True):
         analyze_posts(posts)
-        analyze_comments(comments, posts)
+        analyze_comments(comments, scanned_posts)
 
-    summaries = summarize_posts(posts, comments)
     write_results = [
         (
             POSTS_SHEET_NAME,
-            upsert_by_key(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts),
+            append_new_rows(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts),
         ),
         (
             POST_COMMENTS_SHEET_NAME,
-            upsert_by_key(service, spreadsheet_id, POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, ["comment_id"], comments),
-        ),
-        (
-            POST_SUMMARY_SHEET_NAME,
-            upsert_by_key(service, spreadsheet_id, POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, ["post_id"], summaries),
+            append_new_rows(
+                service,
+                spreadsheet_id,
+                POST_COMMENTS_SHEET_NAME,
+                COMMENT_HEADERS,
+                ["comment_id"],
+                comments,
+            ),
         ),
     ]
     for sheet_name, (updated, appended, total_rows) in write_results:
         print(f"Sheet '{sheet_name}': updated {updated}, appended {appended}, total data rows {total_rows}.")
-    print(f"Synced {len(posts)} posts, {len(comments)} comments/replies, {len(summaries)} summaries.")
+    zeroed_scores = reconcile_answered_response_scores(service, spreadsheet_id)
+    refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
+    print(
+        f"Synced {len(posts)} new posts and {len(comments)} new comments/replies. "
+        f"Zeroed {zeroed_scores} answered response scores and refreshed "
+        f"{refreshed_posts} post counters / {refreshed_summaries} summaries."
+    )
 
 
 if __name__ == "__main__":
