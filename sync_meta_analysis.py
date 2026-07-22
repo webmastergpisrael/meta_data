@@ -16,6 +16,13 @@ from googleapiclient.discovery import build
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 RECOMMENDED_RESPONSE_SCORE_THRESHOLD = 0.70
+DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
+WRITE_RESERVE_SECONDS = 90
+ANALYSIS_RESERVE_SECONDS = 4 * 60
+
+
+class DeadlineReached(RuntimeError):
+    pass
 LEGACY_GEMINI_MODEL_UPGRADES = {
     "gemini-2.5-flash-lite": DEFAULT_GEMINI_MODEL,
 }
@@ -198,7 +205,11 @@ CONFIG = {
     "lookback_days": env_int("LOOKBACK_DAYS", 30),
     "timezone": env_value("TIMEZONE", "UTC"),
     "max_comments_per_run": env_int("MAX_COMMENTS_PER_RUN", 500),
-    "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 1),
+    "max_content_items_per_run": env_int("MAX_CONTENT_ITEMS_PER_RUN", 100),
+    "max_runtime_seconds": env_int("MAX_RUNTIME_SECONDS", DEFAULT_MAX_RUNTIME_SECONDS),
+    "run_started_monotonic": 0.0,
+    "run_deadline_monotonic": 0.0,
+    "analysis_batch_size": env_int("GEMINI_BATCH_SIZE", 10),
     "analysis_text_chars": env_int("ANALYSIS_TEXT_CHARS", 1200),
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 3),
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 20),
@@ -211,6 +222,45 @@ CONFIG = {
     "greenpeace_facebook_page_id": "",
     "greenpeace_instagram_username": "",
 }
+
+
+def start_runtime_budget() -> None:
+    max_runtime_seconds = CONFIG["max_runtime_seconds"]
+    if max_runtime_seconds < WRITE_RESERVE_SECONDS + 60:
+        raise RuntimeError(
+            f"MAX_RUNTIME_SECONDS must be at least {WRITE_RESERVE_SECONDS + 60}"
+        )
+    started = time.monotonic()
+    CONFIG["run_started_monotonic"] = started
+    CONFIG["run_deadline_monotonic"] = started + max_runtime_seconds
+
+
+def elapsed_seconds() -> int:
+    started = float(CONFIG.get("run_started_monotonic") or 0)
+    return int(time.monotonic() - started) if started else 0
+
+
+def remaining_seconds() -> float:
+    deadline = float(CONFIG.get("run_deadline_monotonic") or 0)
+    return deadline - time.monotonic() if deadline else float("inf")
+
+
+def collection_time_available() -> bool:
+    return remaining_seconds() > ANALYSIS_RESERVE_SECONDS
+
+
+def analysis_time_available() -> bool:
+    return remaining_seconds() > WRITE_RESERVE_SECONDS + 5
+
+
+def log_progress(stage: str, message: str) -> None:
+    remaining = remaining_seconds()
+    remaining_label = "unlimited" if remaining == float("inf") else f"{max(0, int(remaining))}s"
+    print(
+        f"[{elapsed_seconds():04d}s][{stage}] {message} "
+        f"(remaining={remaining_label})",
+        flush=True,
+    )
 
 
 def required_env(name: str) -> str:
@@ -636,7 +686,9 @@ def graph_url(path: str, params: dict[str, Any], access_token: str) -> str:
 
 
 def fetch_json(url: str) -> dict[str, Any]:
-    response = requests.get(url, timeout=60)
+    remaining = remaining_seconds()
+    timeout_seconds = 60 if remaining == float("inf") else max(1, min(60, int(remaining - ANALYSIS_RESERVE_SECONDS)))
+    response = requests.get(url, timeout=timeout_seconds)
     try:
         data = response.json() if response.text else {}
     except ValueError as exc:
@@ -662,9 +714,22 @@ def get_all_pages(path: str, params: dict[str, Any], access_token: str, max_item
     if "limit" in page_params:
         page_params["limit"] = meta_page_limit(page_params["limit"])
     url = graph_url(path, page_params, access_token)
+    page_number = 0
     while url:
-        data = fetch_json(url)
-        for item in data.get("data", []):
+        if not collection_time_available():
+            log_progress("meta", f"Stopping pagination for {path}: collection deadline reached after {len(output)} items")
+            break
+        page_number += 1
+        try:
+            data = fetch_json(url)
+        except requests.RequestException:
+            if not collection_time_available():
+                log_progress("deadline", f"Meta request for {path} timed out at the collection deadline")
+                break
+            raise
+        page_items = data.get("data", [])
+        log_progress("meta", f"{path}: page={page_number}, page_items={len(page_items)}, total_items={len(output) + len(page_items)}")
+        for item in page_items:
             output.append(item)
             if max_items and len(output) >= max_items:
                 return output
@@ -827,7 +892,7 @@ def fetch_facebook_posts(page_id: str, post_since: datetime, until: datetime, co
             "limit": 100,
         },
         access_token,
-        0,
+        CONFIG["max_content_items_per_run"],
     )
 
 
@@ -849,7 +914,7 @@ def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: dat
         f"/{ig_user_id}/media",
         {"fields": fields, "since": to_unix(since_date), "until": to_unix(until_date), "limit": 100},
         access_token,
-        0,
+        CONFIG["max_content_items_per_run"],
     )
     return [item for item in media if is_within(item.get("timestamp", ""), since_date, until_date)]
 
@@ -875,6 +940,8 @@ def fetch_facebook_comments_with_replies(
     )
     comments = [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
     for comment in comments:
+        if not collection_time_available():
+            break
         replies = get_all_pages(
             f"/{comment.get('id', '')}/comments",
             {
@@ -907,6 +974,8 @@ def fetch_instagram_comments(
     )
     comments = [comment for comment in comments if is_within(comment.get("timestamp", ""), since_date, until_date)]
     for comment in comments:
+        if not collection_time_available():
+            break
         replies = get_all_pages(
             f"/{comment.get('id', '')}/replies",
             {"fields": "id,text,timestamp,username,like_count", "limit": 100},
@@ -929,7 +998,7 @@ def fetch_ads(ad_account_id: str, since_date: datetime, until_date: datetime, ac
             "limit": 100,
         },
         access_token,
-        0,
+        CONFIG["max_content_items_per_run"],
     )
     return [ad for ad in ads if is_within(ad.get("created_time", ""), since_date, until_date)]
 
@@ -1102,6 +1171,8 @@ def collect_visible_comments(
             clear_brand_comment_analysis(row)
 
     for comment in raw_comments:
+        if not collection_time_available():
+            break
         if is_within(comment.get(date_field, ""), since_date, until_date):
             keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", "", post_url))
 
@@ -1111,6 +1182,8 @@ def collect_visible_comments(
             key=lambda item: meta_date_sort_key(item, date_field),
         )
         for reply in replies:
+            if not collection_time_available():
+                break
             if not is_within(reply.get(date_field, ""), since_date, until_date):
                 continue
             keep_added_comment(
@@ -1148,7 +1221,16 @@ def collect_rows(
     existing_comment_ids = existing_comment_ids or set()
     access_token = meta_access_token()
     window_start, window_end = collection_window()
+    log_progress(
+        "meta",
+        f"Collection window: {window_start.isoformat()} to {window_end.isoformat()}; discovering accounts",
+    )
     meta_context = discover_meta_context(access_token)
+    log_progress(
+        "meta",
+        f"Discovered page={meta_context['page_id'] or 'none'}, instagram={meta_context['ig_user_id'] or 'none'}, "
+        f"ad_account={meta_context['ad_account_id'] or 'none'}",
+    )
     page_token = meta_context["page_access_token"]
 
     posts: list[dict[str, Any]] = []
@@ -1158,6 +1240,13 @@ def collect_rows(
     new_post_ids: set[str] = set()
     seen_comments: set[str] = set(existing_comment_ids)
     max_comments = CONFIG["max_comments_per_run"]
+    max_content_items = CONFIG["max_content_items_per_run"]
+    if max_content_items < 1:
+        raise RuntimeError("MAX_CONTENT_ITEMS_PER_RUN must be at least 1")
+    processed_content_items = 0
+
+    def can_process_content() -> bool:
+        return processed_content_items < max_content_items and collection_time_available()
 
     def register_post(post_row: dict[str, Any]) -> None:
         post_id = str(post_row.get("post_id") or "")
@@ -1168,10 +1257,54 @@ def collect_rows(
             posts.append(post_row)
             new_post_ids.add(post_id)
 
-    for post in fetch_facebook_posts(meta_context["page_id"], window_start, window_end, window_start, page_token):
+    log_progress("collect", f"Loading content lists; global content limit={max_content_items}")
+    facebook_posts = fetch_facebook_posts(meta_context["page_id"], window_start, window_end, window_start, page_token)
+    instagram_media = (
+        fetch_instagram_media(meta_context["ig_user_id"], window_start, window_end, access_token)
+        if collection_time_available()
+        else []
+    )
+    ads = (
+        fetch_ads(meta_context["ad_account_id"], window_start, window_end, access_token)
+        if collection_time_available()
+        else []
+    )
+    content_candidates = [
+        (meta_date_sort_key(post, "created_time"), "facebook", str(post.get("id") or ""))
+        for post in facebook_posts
+        if post.get("id")
+    ]
+    content_candidates.extend(
+        (meta_date_sort_key(media, "timestamp"), "instagram", str(media.get("id") or ""))
+        for media in instagram_media
+        if media.get("id")
+    )
+    content_candidates.extend(
+        (meta_date_sort_key(ad, "created_time"), "ad", str(ad.get("id") or ""))
+        for ad in ads
+        if ad.get("id")
+    )
+    content_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    selected_content = content_candidates[:max_content_items]
+    selected_facebook_ids = {item_id for _, source, item_id in selected_content if source == "facebook"}
+    selected_instagram_ids = {item_id for _, source, item_id in selected_content if source == "instagram"}
+    selected_ad_ids = {item_id for _, source, item_id in selected_content if source == "ad"}
+    log_progress(
+        "collect",
+        f"Content candidates={len(content_candidates)}, selected={len(selected_content)} "
+        f"(facebook={len(selected_facebook_ids)}, instagram={len(selected_instagram_ids)}, ads={len(selected_ad_ids)})",
+    )
+
+    for post in facebook_posts:
+        if str(post.get("id") or "") not in selected_facebook_ids:
+            continue
+        if not can_process_content():
+            break
         post_id = post.get("id", "")
         if not post_id:
             continue
+        processed_content_items += 1
+        comments_before = len(comments)
         scanned_content_ids.add(post_id)
         post_comments = fetch_facebook_comments_with_replies(post_id, window_start, window_end, page_token)
         collect_visible_comments(
@@ -1201,11 +1334,22 @@ def collect_rows(
                 comments=[comment for comment in comments if comment["post_id"] == post_id],
             )
         )
+        log_progress(
+            "collect",
+            f"Facebook item {processed_content_items}/{max_content_items}: id={post_id}, "
+            f"existing={post_id in existing_post_ids}, new_comments={len(comments) - comments_before}",
+        )
 
-    for media in fetch_instagram_media(meta_context["ig_user_id"], window_start, window_end, access_token):
+    for media in instagram_media:
+        if str(media.get("id") or "") not in selected_instagram_ids:
+            continue
+        if not can_process_content():
+            break
         post_id = media.get("id", "")
         if not post_id:
             continue
+        processed_content_items += 1
+        comments_before = len(comments)
         scanned_content_ids.add(post_id)
         post_comments = fetch_instagram_comments(post_id, window_start, window_end, access_token)
         collect_visible_comments(
@@ -1235,8 +1379,19 @@ def collect_rows(
                 comments=[comment for comment in comments if comment["post_id"] == post_id],
             )
         )
+        log_progress(
+            "collect",
+            f"Instagram item {processed_content_items}/{max_content_items}: id={post_id}, "
+            f"existing={post_id in existing_post_ids}, new_comments={len(comments) - comments_before}",
+        )
 
-    for ad in fetch_ads(meta_context["ad_account_id"], window_start, window_end, access_token):
+    for ad in ads:
+        if str(ad.get("id") or "") not in selected_ad_ids:
+            continue
+        if not can_process_content():
+            break
+        processed_content_items += 1
+        comments_before = len(comments)
         creative = ad.get("creative", {})
         campaign_name = ad.get("campaign", {}).get("name", "")
         ad_id = ad.get("id", "")
@@ -1313,6 +1468,11 @@ def collect_rows(
                             comments=[comment for comment in comments if comment["post_id"] == media_id],
                         )
                     )
+        log_progress(
+            "collect",
+            f"Ad item {processed_content_items}/{max_content_items}: ad_id={ad_id}, "
+            f"new_comments={len(comments) - comments_before}",
+        )
     candidate_count = len(comments)
     selected_comments = select_oldest_comments(comments, max_comments)
     deferred_count = candidate_count - len(selected_comments)
@@ -1321,6 +1481,10 @@ def collect_rows(
         f"found={candidate_count}, selected={len(selected_comments)}, deferred={deferred_count}, "
         f"limit={max_comments}."
     )
+    if not collection_time_available():
+        log_progress("deadline", "Collection stopped early to reserve time for Gemini analysis and Sheets writes")
+    elif processed_content_items >= max_content_items:
+        log_progress("collect", f"Reached global content-item limit of {max_content_items}")
     return posts, selected_comments, list(scanned_posts.values())
 
 
@@ -1367,6 +1531,8 @@ def make_post_row(
 
 
 def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
+    if not analysis_time_available():
+        raise DeadlineReached("Not enough time remains for another Gemini request")
     if CONFIG["gemini_quota_exhausted"]:
         if not CONFIG["gemini_quota_notice_printed"]:
             print("Skipping Gemini analysis for the rest of this run because quota is exhausted.")
@@ -1394,6 +1560,8 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict[str, Any] | str | None:
+    if not analysis_time_available():
+        raise DeadlineReached("Gemini analysis deadline reached")
     url, payload, headers = gemini_request(prompt, api_key, mode)
     print(
         "Gemini request: "
@@ -1405,8 +1573,15 @@ def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict
     max_retries = max(0, CONFIG["gemini_max_retries"])
 
     for attempt in range(max_retries + 1):
+        if not analysis_time_available():
+            raise DeadlineReached("Gemini analysis deadline reached before request")
+        request_timeout = max(1, min(120, int(remaining_seconds() - WRITE_RESERVE_SECONDS)))
+        log_progress(
+            "gemini",
+            f"Request attempt={attempt + 1}/{max_retries + 1}, mode={mode}, timeout={request_timeout}s",
+        )
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=120)
+            response = requests.post(url, headers=headers, json=payload, timeout=request_timeout)
             data = response.json() if response.text else {}
         except (requests.RequestException, ValueError) as exc:
             if attempt >= max_retries:
@@ -1532,6 +1707,8 @@ def gemini_response_shape(data: dict[str, Any]) -> str:
 
 def sleep_before_gemini_retry(attempt: int) -> None:
     delay = CONFIG["gemini_retry_base_seconds"] * (2 ** attempt)
+    if remaining_seconds() <= WRITE_RESERVE_SECONDS + delay + 5:
+        raise DeadlineReached("Skipping Gemini retry to preserve Sheets write time")
     print(f"Gemini is temporarily unavailable. Retrying in {delay} seconds...")
     time.sleep(delay)
 
@@ -1544,9 +1721,10 @@ def gemini_fallback_or_raise(message: str) -> dict[str, Any]:
     raise RuntimeError(message)
 
 
-def analyze_posts(posts: list[dict[str, Any]]) -> None:
+def analyze_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not posts:
-        return
+        return []
+    analyzed_posts: list[dict[str, Any]] = []
     schema = {
         "type": "OBJECT",
         "properties": {
@@ -1577,7 +1755,10 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
         },
         "required": ["posts"],
     }
-    for post in posts:
+    for post_index, post in enumerate(posts, start=1):
+        if not analysis_time_available():
+            log_progress("deadline", f"Stopping post analysis at {post_index - 1}/{len(posts)}")
+            break
         item_for_prompt = {
             "post_id": post["post_id"],
             "platform": post["platform"],
@@ -1615,7 +1796,13 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
             '- "הצטרפו אלינו לאירוע קהילתי בגינה" => emotions ["Hope"], sentiment positive.\n\n'
             f"Post:\n{json.dumps(item_for_prompt, ensure_ascii=False)}"
         )
-        analysis = {item["post_id"]: item for item in gemini_generate_json(prompt, schema).get("posts", [])}
+        log_progress("gemini", f"Analyzing new post {post_index}/{len(posts)}: id={post['post_id']}")
+        try:
+            generated = gemini_generate_json(prompt, schema)
+        except DeadlineReached:
+            log_progress("deadline", f"Post analysis deadline reached at {post_index - 1}/{len(posts)}")
+            break
+        analysis = {item["post_id"]: item for item in generated.get("posts", [])}
         item = analysis.get(post["post_id"], {})
         post["canonical_topic"] = clean_text(item.get("canonical_topic", "")) or "unknown"
         post["canonical_subtopic"] = clean_text(item.get("canonical_subtopic", "")) or "unknown"
@@ -1623,11 +1810,18 @@ def analyze_posts(posts: list[dict[str, Any]]) -> None:
         post["topic_confidence"] = bounded_float(item.get("topic_confidence"), 0.0, 1.0)
         post["post_emotions"] = allowed_list(item.get("post_emotions"), POST_EMOTIONS, ["Neutral"])
         post["post_sentiment"] = allowed_value(item.get("post_sentiment"), POST_SENTIMENTS, "unclear")
+        analyzed_posts.append(post)
+    return analyzed_posts
 
 
-def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]) -> None:
+def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not comments:
-        return
+        return []
+    for comment in comments:
+        if comment.get("is_brand_comment"):
+            clear_brand_comment_analysis(comment)
+    completed_comments = [comment for comment in comments if comment.get("is_brand_comment")]
+    audience_comments = [comment for comment in comments if not comment.get("is_brand_comment")]
     post_context = {
         post["post_id"]: {
             "post_message": truncate_text(post["post_message"]),
@@ -1670,11 +1864,17 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
         },
         "required": ["comments"],
     }
-    for batch_start in range(0, len(comments), CONFIG["analysis_batch_size"]):
-        batch = comments[batch_start : batch_start + CONFIG["analysis_batch_size"]]
-        for comment in batch:
-            if comment.get("is_brand_comment"):
-                clear_brand_comment_analysis(comment)
+    batch_size = max(1, CONFIG["analysis_batch_size"])
+    total_batches = (len(audience_comments) + batch_size - 1) // batch_size
+    for batch_number, batch_start in enumerate(range(0, len(audience_comments), batch_size), start=1):
+        if not analysis_time_available():
+            log_progress(
+                "deadline",
+                f"Stopping comment analysis after {len(completed_comments) - sum(1 for item in completed_comments if item.get('is_brand_comment'))} "
+                f"audience comments; {len(audience_comments) - batch_start} deferred",
+            )
+            break
+        batch = audience_comments[batch_start : batch_start + batch_size]
 
         items = [
             {
@@ -1686,10 +1886,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                 "is_brand_comment": bool(comment.get("is_brand_comment")),
             }
             for comment in batch
-            if not comment.get("is_brand_comment")
         ]
-        if not items:
-            continue
         prompt = (
             "Analyze Hebrew/English social media comments for Greenpeace Israel. "
             "Classify audience reaction to Greenpeace content, not the emotion of the post itself. "
@@ -1737,10 +1934,18 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             '- "@friend" or only tagging a friend => emotions ["Neutral"], sentiment neutral, intent tag_friend.\n\n'
             f"Comments:\n{json.dumps(items, ensure_ascii=False)}"
         )
-        analysis = {item["comment_id"]: item for item in gemini_generate_json(prompt, schema).get("comments", [])}
+        log_progress(
+            "gemini",
+            f"Analyzing comment batch {batch_number}/{total_batches}: batch_size={len(batch)}, "
+            f"completed_audience={batch_start}/{len(audience_comments)}",
+        )
+        try:
+            generated = gemini_generate_json(prompt, schema)
+        except DeadlineReached:
+            log_progress("deadline", f"Comment analysis deadline reached before batch {batch_number}/{total_batches}")
+            break
+        analysis = {item["comment_id"]: item for item in generated.get("comments", [])}
         for comment in batch:
-            if comment.get("is_brand_comment"):
-                continue
             item = analysis.get(comment["comment_id"], {})
             comment["comment_emotions"] = allowed_list(item.get("comment_emotions"), COMMENT_EMOTIONS, ["Neutral"])
             comment["emotion_confidence"] = bounded_float(item.get("emotion_confidence"), 0.0, 1.0)
@@ -1749,8 +1954,10 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             comment["comment_intent"] = allowed_value(item.get("comment_intent"), COMMENT_INTENTS, "other")
             comment["is_sarcastic"] = bool(item.get("is_sarcastic", False))
             comment["response_value_score"] = bounded_float(item.get("response_value_score"), 0.0, 1.0)
+        completed_comments.extend(batch)
 
-    zero_response_scores_for_answered_comments(comments)
+    zero_response_scores_for_answered_comments(completed_comments)
+    return completed_comments
 
 
 def allowed_value(value: Any, allowed: list[str], default: str) -> str:
@@ -1932,10 +2139,20 @@ def refresh_derived_metrics(service, spreadsheet_id: str) -> tuple[int, int]:
 
 
 def sync() -> None:
+    start_runtime_budget()
+    log_progress(
+        "start",
+        f"Starting sync: lookback_days={CONFIG['lookback_days']}, "
+        f"content_limit={CONFIG['max_content_items_per_run']}, "
+        f"comment_limit={CONFIG['max_comments_per_run']}, "
+        f"runtime_limit={CONFIG['max_runtime_seconds']}s, "
+        f"gemini_batch_size={CONFIG['analysis_batch_size']}",
+    )
     spreadsheet_id = required_env("SPREADSHEET_ID")
     service = get_sheets_service()
+    log_progress("sheets", "Ensuring Google Sheets schema")
     ensure_schema(service, spreadsheet_id)
-    print(f"Writing to Google Sheets spreadsheet: {spreadsheet_id}")
+    log_progress("sheets", f"Using spreadsheet {spreadsheet_id}")
 
     known_post_ids = existing_ids(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, "post_id")
     known_comment_ids = existing_ids(
@@ -1945,13 +2162,30 @@ def sync() -> None:
         COMMENT_HEADERS,
         "comment_id",
     )
-    print(f"Found {len(known_post_ids)} existing posts and {len(known_comment_ids)} existing comments in Google Sheets.")
+    log_progress(
+        "sheets",
+        f"Loaded existing IDs: posts={len(known_post_ids)}, comments={len(known_comment_ids)}",
+    )
 
     posts, comments, scanned_posts = collect_rows(known_post_ids, known_comment_ids)
     if env_bool("ANALYZE_WITH_GEMINI", True):
-        analyze_posts(posts)
-        analyze_comments(comments, scanned_posts)
+        discovered_post_count = len(posts)
+        discovered_comment_count = len(comments)
+        posts = analyze_posts(posts)
+        eligible_post_ids = known_post_ids | {str(post.get("post_id") or "") for post in posts}
+        eligible_comments = [
+            comment
+            for comment in comments
+            if str(comment.get("post_id") or "") in eligible_post_ids
+        ]
+        comments = analyze_comments(eligible_comments, scanned_posts)
+        log_progress(
+            "deadline",
+            f"Analysis result: posts_completed={len(posts)}/{discovered_post_count}, "
+            f"comments_completed={len(comments)}/{discovered_comment_count}; unfinished items remain eligible next run",
+        )
 
+    log_progress("sheets", f"Writing completed items: new_posts={len(posts)}, new_comments={len(comments)}")
     write_results = [
         (
             POSTS_SHEET_NAME,
@@ -1970,13 +2204,17 @@ def sync() -> None:
         ),
     ]
     for sheet_name, (updated, appended, total_rows) in write_results:
-        print(f"Sheet '{sheet_name}': updated {updated}, appended {appended}, total data rows {total_rows}.")
+        log_progress(
+            "sheets",
+            f"Sheet '{sheet_name}': updated={updated}, appended={appended}, total_rows={total_rows}",
+        )
     zeroed_scores = reconcile_answered_response_scores(service, spreadsheet_id)
     refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
-    print(
+    log_progress(
+        "complete",
         f"Synced {len(posts)} new posts and {len(comments)} new comments/replies. "
         f"Zeroed {zeroed_scores} answered response scores and refreshed "
-        f"{refreshed_posts} post counters / {refreshed_summaries} summaries."
+        f"{refreshed_posts} post counters / {refreshed_summaries} summaries.",
     )
 
 
