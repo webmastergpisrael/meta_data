@@ -125,6 +125,45 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in items], ["1", "2"])
         self.assertEqual(fetch.call_count, 2)
 
+    def test_deadline_leaves_unanalyzed_audience_comment_for_next_run(self):
+        comment = {
+            "comment_id": "new-comment",
+            "post_id": "existing-post",
+            "comment_message": "Needs analysis",
+            "is_brand_comment": False,
+        }
+        post = {
+            "post_id": "existing-post",
+            "post_message": "Context",
+            "platform": "facebook",
+            "source_type": "organic",
+        }
+
+        with patch.object(sync, "analysis_time_available", return_value=False):
+            completed = sync.analyze_comments([comment], [post])
+
+        self.assertEqual(completed, [])
+
+    def test_brand_comment_can_be_written_without_gemini_at_deadline(self):
+        comment = {
+            "comment_id": "brand-comment",
+            "post_id": "existing-post",
+            "comment_message": "Official reply",
+            "is_brand_comment": True,
+        }
+        post = {
+            "post_id": "existing-post",
+            "post_message": "Context",
+            "platform": "facebook",
+            "source_type": "organic",
+        }
+
+        with patch.object(sync, "analysis_time_available", return_value=False):
+            completed = sync.analyze_comments([comment], [post])
+
+        self.assertEqual([item["comment_id"] for item in completed], ["brand-comment"])
+        self.assertEqual(completed[0]["response_value_score"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
