@@ -3,34 +3,16 @@ name: Meta data sync
 on:
   workflow_dispatch:
     inputs:
-      max_facebook_posts:
-        description: "How many Facebook posts to fetch"
-        required: false
-        default: "1"
-      max_instagram_media:
-        description: "How many Instagram posts to fetch"
-        required: false
-        default: "1"
-      max_paid_posts:
-        description: "How many paid posts to fetch"
-        required: false
-        default: "0"
-      max_ads:
-        description: "How many ads to scan"
-        required: false
-        default: "10"
-      max_comments_per_post:
-        description: "How many audience comments to fetch per post/media/paid post"
-        required: false
-        default: "5"
-      max_brand_comments_per_post:
-        description: "How many organization comments to fetch per post/media/paid post"
-        required: false
-        default: "5"
       lookback_days:
         description: "How many recent days to scan, counting back from today"
-        required: false
-        default: "7"
+        required: true
+        default: "30"
+        type: number
+      max_comments:
+        description: "Maximum number of new comments to collect across all platforms"
+        required: true
+        default: "500"
+        type: number
       gemini_model:
         description: "Gemini model to use"
         required: false
@@ -54,6 +36,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run tests
+        run: python -m unittest -v
+
       - name: Sync Meta data to Google Sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -63,13 +48,8 @@ jobs:
           META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION }}
           GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-3.1-flash-lite' }}
           GEMINI_API_MODE: ${{ vars.GEMINI_API_MODE || 'generateContent' }}
-          MAX_FACEBOOK_POSTS: ${{ github.event.inputs.max_facebook_posts || vars.MAX_FACEBOOK_POSTS || '1' }}
-          MAX_INSTAGRAM_MEDIA: ${{ github.event.inputs.max_instagram_media || vars.MAX_INSTAGRAM_MEDIA || '1' }}
-          MAX_PAID_POSTS: ${{ github.event.inputs.max_paid_posts || vars.MAX_PAID_POSTS || '0' }}
-          MAX_ADS: ${{ github.event.inputs.max_ads || vars.MAX_ADS || '10' }}
-          MAX_COMMENTS_PER_POST: ${{ github.event.inputs.max_comments_per_post || vars.MAX_COMMENTS_PER_POST || '5' }}
-          MAX_BRAND_COMMENTS_PER_POST: ${{ github.event.inputs.max_brand_comments_per_post || vars.MAX_BRAND_COMMENTS_PER_POST || '5' }}
-          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || vars.LOOKBACK_DAYS || '7' }}
+          LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || '30' }}
+          MAX_COMMENTS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || '500' }}
           GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '1' }}
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
           GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '3' }}
