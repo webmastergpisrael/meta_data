@@ -13,6 +13,11 @@ on:
         required: true
         default: "500"
         type: number
+      max_content_items:
+        description: "Maximum number of posts/media/ads to scan across all platforms"
+        required: true
+        default: "100"
+        type: number
       gemini_model:
         description: "Gemini model to use"
         required: false
@@ -23,6 +28,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
@@ -50,12 +56,15 @@ jobs:
           GEMINI_API_MODE: ${{ vars.GEMINI_API_MODE || 'generateContent' }}
           LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || '30' }}
           MAX_COMMENTS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || '500' }}
-          GEMINI_BATCH_SIZE: ${{ vars.GEMINI_BATCH_SIZE || '1' }}
+          MAX_CONTENT_ITEMS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_content_items || '100' }}
+          MAX_RUNTIME_SECONDS: "900"
+          GEMINI_BATCH_SIZE: "10"
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
           GEMINI_MAX_RETRIES: ${{ vars.GEMINI_MAX_RETRIES || '3' }}
           GEMINI_RETRY_BASE_SECONDS: ${{ vars.GEMINI_RETRY_BASE_SECONDS || '20' }}
           GEMINI_FALLBACK_ON_ERROR: ${{ vars.GEMINI_FALLBACK_ON_ERROR || 'false' }}
           GEMINI_FALLBACK_AFTER_QUOTA_ERROR: ${{ vars.GEMINI_FALLBACK_AFTER_QUOTA_ERROR || 'false' }}
           ANALYZE_WITH_GEMINI: "true"
+          PYTHONUNBUFFERED: "1"
           TIMEZONE: Asia/Jerusalem
-        run: python sync_meta_analysis.py
+        run: python -u sync_meta_analysis.py
