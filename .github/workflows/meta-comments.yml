@@ -57,7 +57,8 @@ jobs:
           LOOKBACK_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.lookback_days || '30' }}
           MAX_COMMENTS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_comments || '500' }}
           MAX_CONTENT_ITEMS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.max_content_items || '100' }}
-          COMMENTS_PER_EXISTING_POST_COVERAGE: ${{ vars.COMMENTS_PER_EXISTING_POST_COVERAGE || '5' }}
+          FULL_SCAN_INTERVAL_DAYS: ${{ vars.FULL_SCAN_INTERVAL_DAYS || '30' }}
+          DELTA_OVERLAP_HOURS: ${{ vars.DELTA_OVERLAP_HOURS || '24' }}
           MAX_RUNTIME_SECONDS: "900"
           GEMINI_BATCH_SIZE: "10"
           ANALYSIS_TEXT_CHARS: ${{ vars.ANALYSIS_TEXT_CHARS || '1200' }}
