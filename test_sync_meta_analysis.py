@@ -21,6 +21,75 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "MAX_COMMENTS_PER_RUN"):
             sync.select_oldest_comments([], 0)
 
+    def test_existing_posts_receive_comment_coverage_before_global_fill(self):
+        comments = [
+            {
+                "comment_id": "busy-1",
+                "post_id": "busy-existing",
+                "comment_created_time": "2026-07-01T00:00:00+00:00",
+                "is_brand_comment": False,
+            },
+            {
+                "comment_id": "busy-2",
+                "post_id": "busy-existing",
+                "comment_created_time": "2026-07-02T00:00:00+00:00",
+                "is_brand_comment": False,
+            },
+            {
+                "comment_id": "new-post-oldest",
+                "post_id": "new-post",
+                "comment_created_time": "2026-06-30T00:00:00+00:00",
+                "is_brand_comment": False,
+            },
+            {
+                "comment_id": "uncovered-1",
+                "post_id": "uncovered-existing",
+                "comment_created_time": "2026-07-03T00:00:00+00:00",
+                "is_brand_comment": False,
+            },
+        ]
+
+        selected, coverage_count = sync.select_comments_with_existing_post_coverage(
+            comments,
+            max_comments=3,
+            existing_post_ids={"busy-existing", "uncovered-existing"},
+            existing_audience_counts={"busy-existing": 100},
+            per_post_coverage=1,
+        )
+
+        self.assertEqual(coverage_count, 2)
+        self.assertEqual(
+            {comment["comment_id"] for comment in selected},
+            {"busy-1", "uncovered-1", "new-post-oldest"},
+        )
+
+    def test_brand_replies_do_not_consume_existing_post_coverage(self):
+        comments = [
+            {
+                "comment_id": "brand",
+                "post_id": "existing",
+                "comment_created_time": "2026-07-01T00:00:00+00:00",
+                "is_brand_comment": True,
+            },
+            {
+                "comment_id": "audience",
+                "post_id": "existing",
+                "comment_created_time": "2026-07-02T00:00:00+00:00",
+                "is_brand_comment": False,
+            },
+        ]
+
+        selected, coverage_count = sync.select_comments_with_existing_post_coverage(
+            comments,
+            max_comments=1,
+            existing_post_ids={"existing"},
+            existing_audience_counts={},
+            per_post_coverage=1,
+        )
+
+        self.assertEqual(coverage_count, 1)
+        self.assertEqual(selected[0]["comment_id"], "audience")
+
     def test_existing_post_is_scanned_but_not_returned_for_analysis(self):
         start = datetime(2026, 7, 1, tzinfo=timezone.utc)
         end = datetime(2026, 7, 31, tzinfo=timezone.utc)
@@ -61,6 +130,52 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         self.assertEqual(posts, [])
         self.assertEqual([comment["comment_id"] for comment in comments], ["new-comment"])
         self.assertEqual([post["post_id"] for post in scanned_posts], ["existing-post"])
+
+    def test_existing_content_is_selected_before_older_new_content(self):
+        start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 31, tzinfo=timezone.utc)
+        posts_from_meta = [
+            {
+                "id": "older-new-post",
+                "created_time": "2026-07-02T00:00:00+00:00",
+                "message": "Older but not stored",
+            },
+            {
+                "id": "existing-post",
+                "created_time": "2026-07-03T00:00:00+00:00",
+                "message": "Already stored",
+            },
+        ]
+
+        with (
+            patch.dict(sync.CONFIG, {"max_content_items_per_run": 1, "max_comments_per_run": 500}),
+            patch.object(sync, "meta_access_token", return_value="token"),
+            patch.object(sync, "collection_window", return_value=(start, end)),
+            patch.object(
+                sync,
+                "discover_meta_context",
+                return_value={
+                    "page_id": "page",
+                    "page_access_token": "page-token",
+                    "ig_user_id": "",
+                    "ad_account_id": "",
+                },
+            ),
+            patch.object(sync, "fetch_facebook_posts", return_value=posts_from_meta),
+            patch.object(sync, "fetch_facebook_comments_with_replies", return_value=[]) as fetch_comments,
+            patch.object(sync, "fetch_instagram_media", return_value=[]),
+            patch.object(sync, "fetch_ads", return_value=[]),
+        ):
+            posts, comments, scanned_posts = sync.collect_rows(
+                {"existing-post"},
+                set(),
+                {"existing-post": 0},
+            )
+
+        self.assertEqual(posts, [])
+        self.assertEqual(comments, [])
+        self.assertEqual([post["post_id"] for post in scanned_posts], ["existing-post"])
+        self.assertEqual(fetch_comments.call_args.args[0], "existing-post")
 
     def test_existing_comment_is_not_collected_again(self):
         start = datetime(2026, 7, 1, tzinfo=timezone.utc)
