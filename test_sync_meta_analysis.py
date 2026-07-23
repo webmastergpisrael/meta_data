@@ -60,7 +60,7 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         self.assertEqual(coverage_count, 2)
         self.assertEqual(
             {comment["comment_id"] for comment in selected},
-            {"busy-1", "uncovered-1", "new-post-oldest"},
+            {"busy-1", "busy-2", "uncovered-1"},
         )
 
     def test_brand_replies_do_not_consume_existing_post_coverage(self):
@@ -299,6 +299,31 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
 
         self.assertFalse(changed)
         self.assertEqual(comment["response_value_score"], 0.8)
+
+    def test_scan_checkpoint_waits_until_all_discovered_comments_are_completed(self):
+        post_row = [""] * len(sync.POST_HEADERS)
+        post_row[sync.POST_HEADERS.index("post_id")] = "existing-post"
+        scanned_post = {
+            "post_id": "existing-post",
+            "collected_window_start": "2026-07-01T00:00:00+00:00",
+            "collected_window_end": "2026-07-31T00:00:00+00:00",
+            "_new_comment_ids": {"comment-1", "comment-2"},
+        }
+        service = object()
+
+        with (
+            patch.object(sync, "get_values", return_value=[post_row]),
+            patch.object(sync, "batch_update_values") as batch_update,
+        ):
+            advanced, held = sync.update_scanned_post_checkpoints(
+                service,
+                "spreadsheet",
+                [scanned_post],
+                [{"comment_id": "comment-1"}],
+            )
+
+        self.assertEqual((advanced, held), (0, 1))
+        batch_update.assert_called_once_with(service, "spreadsheet", [])
 
     def test_later_brand_reply_zeros_existing_audience_score(self):
         comments = [
