@@ -2515,3 +2515,153 @@ def update_scanned_post_checkpoints(
     if not scanned_posts:
         return 0, 0
 
+    completed_comment_ids = {
+        str(comment.get("comment_id") or "")
+        for comment in completed_comments
+        if comment.get("comment_id")
+    }
+    raw_rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"),
+    )
+    post_id_index = POST_HEADERS.index("post_id")
+    sheet_row_by_post_id = {
+        str(pad_row(row, len(POST_HEADERS))[post_id_index] or "").strip(): row_number
+        for row_number, row in enumerate(raw_rows, start=2)
+        if str(pad_row(row, len(POST_HEADERS))[post_id_index] or "").strip()
+    }
+    start_column = POST_HEADERS.index("collected_window_start") + 1
+    end_column = POST_HEADERS.index("collected_window_end") + 1
+    updates: list[dict[str, Any]] = []
+    incomplete = 0
+    for post in scanned_posts:
+        post_id = str(post.get("post_id") or "")
+        sheet_row = sheet_row_by_post_id.get(post_id)
+        if not sheet_row:
+            continue
+        discovered_comment_ids = {
+            str(comment_id)
+            for comment_id in post.get("_new_comment_ids", set())
+            if comment_id
+        }
+        if not discovered_comment_ids.issubset(completed_comment_ids):
+            incomplete += 1
+            continue
+        updates.append(
+            {
+                "range": sheet_range(
+                    POSTS_SHEET_NAME,
+                    f"{col_letter(start_column)}{sheet_row}:{col_letter(end_column)}{sheet_row}",
+                ),
+                "values": [[post.get("collected_window_start", ""), post.get("collected_window_end", "")]],
+            }
+        )
+    batch_update_values(service, spreadsheet_id, updates)
+    return len(updates), incomplete
+
+
+def sync() -> None:
+    start_runtime_budget()
+    log_progress(
+        "start",
+        f"Starting sync: lookback_days={CONFIG['lookback_days']}, "
+        f"content_limit={CONFIG['max_content_items_per_run']}, "
+        f"comment_limit={CONFIG['max_comments_per_run']}, "
+        f"existing_post_coverage={CONFIG['comments_per_existing_post_coverage']}, "
+        f"runtime_limit={CONFIG['max_runtime_seconds']}s, "
+        f"gemini_batch_size={CONFIG['analysis_batch_size']}",
+    )
+    spreadsheet_id = required_env("SPREADSHEET_ID")
+    service = get_sheets_service()
+    log_progress("sheets", "Ensuring Google Sheets schema")
+    ensure_schema(service, spreadsheet_id)
+    log_progress("sheets", f"Using spreadsheet {spreadsheet_id}")
+
+    known_post_ids, existing_post_last_scanned = existing_post_state(service, spreadsheet_id)
+    known_comment_ids, existing_audience_counts = existing_comment_state(service, spreadsheet_id)
+    log_progress(
+        "sheets",
+        f"Loaded existing IDs: posts={len(known_post_ids)}, comments={len(known_comment_ids)}, "
+        f"posts_with_audience_comments={sum(1 for count in existing_audience_counts.values() if count > 0)}, "
+        f"posts_with_scan_checkpoint={len(existing_post_last_scanned)}",
+    )
+
+    posts, comments, scanned_posts = collect_rows(
+        known_post_ids,
+        known_comment_ids,
+        existing_audience_counts,
+        existing_post_last_scanned,
+    )
+    if env_bool("ANALYZE_WITH_GEMINI", True):
+        discovered_post_count = len(posts)
+        discovered_comment_count = len(comments)
+        posts = analyze_posts(posts)
+        eligible_post_ids = known_post_ids | {str(post.get("post_id") or "") for post in posts}
+        eligible_comments = [
+            comment
+            for comment in comments
+            if str(comment.get("post_id") or "") in eligible_post_ids
+        ]
+        comments = analyze_comments(eligible_comments, scanned_posts)
+        log_progress(
+            "deadline",
+            f"Analysis result: posts_completed={len(posts)}/{discovered_post_count}, "
+            f"comments_completed={len(comments)}/{discovered_comment_count}; unfinished items remain eligible next run",
+        )
+
+    # The Sheets HTTP connection can be idle for several minutes during Meta
+    # collection and Gemini analysis. Rebuild it before writes so a server-side
+    # idle disconnect cannot discard the completed analysis.
+    log_progress("sheets", "Refreshing Google Sheets connection before writes")
+    service = get_sheets_service()
+    log_progress(
+        "sheets",
+        f"Writing completed items: new_posts={len(posts)}, new_comments={len(comments)}; "
+        f"safe_api_retries={SHEETS_API_RETRIES}",
+    )
+    write_results = [
+        (
+            POSTS_SHEET_NAME,
+            append_new_rows(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts),
+        ),
+        (
+            POST_COMMENTS_SHEET_NAME,
+            append_new_rows(
+                service,
+                spreadsheet_id,
+                POST_COMMENTS_SHEET_NAME,
+                COMMENT_HEADERS,
+                ["comment_id"],
+                comments,
+            ),
+        ),
+    ]
+    for sheet_name, (updated, appended, total_rows) in write_results:
+        log_progress(
+            "sheets",
+            f"Sheet '{sheet_name}': updated={updated}, appended={appended}, total_rows={total_rows}",
+        )
+    checkpointed_posts, incomplete_post_scans = update_scanned_post_checkpoints(
+        service,
+        spreadsheet_id,
+        scanned_posts,
+        comments,
+    )
+    log_progress(
+        "sheets",
+        f"Existing-first queue checkpoints advanced={checkpointed_posts}, "
+        f"held_for_deferred_or_unanalyzed_comments={incomplete_post_scans}",
+    )
+    zeroed_scores = reconcile_answered_response_scores(service, spreadsheet_id)
+    refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
+    log_progress(
+        "complete",
+        f"Synced {len(posts)} new posts and {len(comments)} new comments/replies. "
+        f"Zeroed {zeroed_scores} answered response scores and refreshed "
+        f"{refreshed_posts} post counters / {refreshed_summaries} summaries.",
+    )
+
+
+if __name__ == "__main__":
+    sync()
