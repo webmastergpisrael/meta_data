@@ -89,6 +89,102 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
 
         self.assertEqual(comments, [])
 
+    def test_reply_context_uses_structural_parent_not_previous_sibling(self):
+        start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 31, tzinfo=timezone.utc)
+        comments = []
+        raw_comments = [
+            {
+                "id": "root",
+                "created_time": "2026-07-02T00:00:00+00:00",
+                "message": "Root question",
+                "from": {"id": "first-user", "name": "First User"},
+                "comments": {
+                    "data": [
+                        {
+                            "id": "reply-1",
+                            "created_time": "2026-07-03T00:00:00+00:00",
+                            "message": "First sibling reply",
+                            "from": {"id": "second-user", "name": "Second User"},
+                        },
+                        {
+                            "id": "reply-2",
+                            "created_time": "2026-07-04T00:00:00+00:00",
+                            "message": "Second sibling reply",
+                            "from": {"id": "third-user", "name": "Third User"},
+                        },
+                    ]
+                },
+            }
+        ]
+
+        sync.collect_visible_comments(
+            comments,
+            set(),
+            "facebook",
+            "post",
+            raw_comments,
+            "https://example.com/post",
+            start,
+            end,
+        )
+
+        second_reply = next(comment for comment in comments if comment["comment_id"] == "reply-2")
+        self.assertEqual(second_reply["parent_comment_id"], "root")
+        self.assertEqual(second_reply["parent_comment_message"], "Root question")
+        self.assertEqual(second_reply["_parent_commenter_name"], "First User")
+
+    def test_user_to_user_reply_score_is_forced_to_zero(self):
+        comment = {
+            "comment_message": "יש לך הוכחות?",
+            "parent_comment_id": "audience-parent",
+            "_parent_is_brand_comment": False,
+            "comment_intent": "question",
+            "response_value_score": 0.85,
+        }
+
+        changed = sync.enforce_response_routing(
+            comment,
+            {"reply_target": "another_user", "criticism_target": "another_user"},
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(comment["response_value_score"], 0.0)
+
+    def test_reply_directed_to_greenpeace_keeps_score(self):
+        comment = {
+            "comment_message": "Greenpeace Israel, תביאו הוכחות",
+            "parent_comment_id": "audience-parent",
+            "_parent_is_brand_comment": False,
+            "comment_intent": "criticism",
+            "response_value_score": 0.85,
+        }
+
+        changed = sync.enforce_response_routing(
+            comment,
+            {"reply_target": "greenpeace", "criticism_target": "greenpeace"},
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(comment["response_value_score"], 0.85)
+
+    def test_reply_to_brand_comment_keeps_score(self):
+        comment = {
+            "comment_message": "אז איפה חותמים?",
+            "parent_comment_id": "brand-parent",
+            "_parent_is_brand_comment": True,
+            "comment_intent": "information_request",
+            "response_value_score": 0.8,
+        }
+
+        changed = sync.enforce_response_routing(
+            comment,
+            {"reply_target": "greenpeace", "criticism_target": "unclear"},
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(comment["response_value_score"], 0.8)
+
     def test_later_brand_reply_zeros_existing_audience_score(self):
         comments = [
             {
