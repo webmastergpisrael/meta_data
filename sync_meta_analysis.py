@@ -479,36 +479,113 @@ def migrate_sheet_headers(
         clear_values(service, spreadsheet_id, sheet_range(sheet_name, f"{col_letter(len(desired_headers) + 1)}:{col_letter(width)}"))
 
 
+def normalized_person_name(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lstrip("@")).casefold()
+
+
+def brand_reply_addresses_commenter(brand_message: Any, commenter_name: Any) -> bool:
+    message = normalized_person_name(brand_message)
+    name = normalized_person_name(commenter_name)
+    if not message or not name or not message.startswith(name):
+        return False
+    return len(message) == len(name) or not message[len(name)].isalnum()
+
+
+def answered_audience_comment_ids(comments: list[dict[str, Any]]) -> set[str]:
+    """Resolve direct and unambiguous sibling-thread Greenpeace replies."""
+    prepared: list[tuple[datetime, str, dict[str, Any]]] = []
+    audience_by_key: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
+    for comment in comments:
+        comment_id = str(comment.get("comment_id") or "")
+        post_id = str(comment.get("post_id") or "")
+        created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
+        if not comment_id or not post_id or not created_at:
+            continue
+        prepared.append((created_at, comment_id, comment))
+        if not comment.get("is_brand_comment"):
+            audience_by_key[(post_id, comment_id)] = (created_at, comment)
+
+    answered: set[str] = set()
+
+    # Exact Meta parent linkage remains the strongest signal.
+    for created_at, _, comment in prepared:
+        if not comment.get("is_brand_comment"):
+            continue
+        post_id = str(comment.get("post_id") or "")
+        parent_id = str(comment.get("parent_comment_id") or "")
+        target = audience_by_key.get((post_id, parent_id))
+        if target and created_at > target[0]:
+            answered.add(parent_id)
+
+    # Facebook often represents a reply to a reply as a sibling under the
+    # same root. Match only a single pending audience comment, or an explicit
+    # leading commenter-name mention, to avoid guessing among users.
+    siblings_by_thread: dict[tuple[str, str], list[tuple[datetime, str, dict[str, Any]]]] = defaultdict(list)
+    for item in prepared:
+        comment = item[2]
+        parent_id = str(comment.get("parent_comment_id") or "")
+        if not parent_id:
+            continue
+        siblings_by_thread[(str(comment.get("post_id") or ""), parent_id)].append(item)
+
+    for thread_items in siblings_by_thread.values():
+        pending_audience: list[tuple[datetime, str, dict[str, Any]]] = []
+        for created_at, comment_id, comment in sorted(thread_items, key=lambda item: (item[0], item[1])):
+            if not comment.get("is_brand_comment"):
+                pending_audience.append((created_at, comment_id, comment))
+                continue
+            if not pending_audience:
+                continue
+
+            name_matches = [
+                item
+                for item in pending_audience
+                if brand_reply_addresses_commenter(
+                    comment.get("comment_message", ""),
+                    item[2].get("commenter_name", ""),
+                )
+            ]
+            if name_matches:
+                answered.add(name_matches[-1][1])
+            elif len(pending_audience) == 1:
+                answered.add(pending_audience[0][1])
+            pending_audience.clear()
+
+    return answered
+
+
 def zero_answered_scores_in_rows(rows: list[list[Any]], headers: list[str]) -> None:
     required = {
         "comment_id",
         "post_id",
         "parent_comment_id",
         "comment_created_time",
+        "commenter_name",
         "is_brand_comment",
+        "comment_message",
         "response_value_score",
     }
     if not required.issubset(headers):
         return
 
     index = {header: headers.index(header) for header in required}
-    brand_reply_times_by_thread: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+    comments: list[dict[str, Any]] = []
     for row in rows:
-        is_brand = str(row[index["is_brand_comment"]] or "").strip().lower() == "true"
-        parent_id = str(row[index["parent_comment_id"]] or "")
-        created_at = parse_meta_date(str(row[index["comment_created_time"]] or ""))
-        if is_brand and parent_id and created_at:
-            key = (str(row[index["post_id"]] or ""), parent_id)
-            brand_reply_times_by_thread[key].append(created_at)
+        comments.append(
+            {
+                "comment_id": str(row[index["comment_id"]] or ""),
+                "post_id": str(row[index["post_id"]] or ""),
+                "parent_comment_id": str(row[index["parent_comment_id"]] or ""),
+                "comment_created_time": str(row[index["comment_created_time"]] or ""),
+                "commenter_name": str(row[index["commenter_name"]] or ""),
+                "is_brand_comment": str(row[index["is_brand_comment"]] or "").strip().lower() == "true",
+                "comment_message": str(row[index["comment_message"]] or ""),
+            }
+        )
 
+    answered_ids = answered_audience_comment_ids(comments)
     for row in rows:
-        is_brand = str(row[index["is_brand_comment"]] or "").strip().lower() == "true"
-        created_at = parse_meta_date(str(row[index["comment_created_time"]] or ""))
-        if is_brand or not created_at:
-            continue
-        comment_id = str(row[index["comment_id"]] or "")
-        key = (str(row[index["post_id"]] or ""), comment_id)
-        if any(reply_time > created_at for reply_time in brand_reply_times_by_thread.get(key, [])):
+        if str(row[index["comment_id"]] or "") in answered_ids:
             row[index["response_value_score"]] = 0
 
 
@@ -1221,24 +1298,9 @@ def clear_brand_comment_analysis(comment: dict[str, Any]) -> None:
 
 def zero_response_scores_for_answered_comments(comments: list[dict[str, Any]]) -> None:
     """An already answered comment has no remaining response value."""
-    brand_reply_times_by_thread: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+    answered_ids = answered_audience_comment_ids(comments)
     for comment in comments:
-        parent_id = str(comment.get("parent_comment_id") or "")
-        if not comment.get("is_brand_comment") or not parent_id:
-            continue
-        created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
-        if created_at:
-            brand_reply_times_by_thread[(str(comment.get("post_id") or ""), parent_id)].append(created_at)
-
-    for comment in comments:
-        if comment.get("is_brand_comment"):
-            continue
-        created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
-        if not created_at:
-            continue
-        comment_id = str(comment.get("comment_id") or "")
-        reply_times = brand_reply_times_by_thread.get((str(comment.get("post_id") or ""), comment_id), [])
-        if any(reply_time > created_at for reply_time in reply_times):
+        if str(comment.get("comment_id") or "") in answered_ids:
             comment["response_value_score"] = 0.0
 
 
