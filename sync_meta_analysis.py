@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import time
@@ -24,6 +25,14 @@ SHEETS_API_RETRIES = 3
 
 class DeadlineReached(RuntimeError):
     pass
+
+
+class MetaAPIError(RuntimeError):
+    def __init__(self, status_code: int, code: int, message: str):
+        super().__init__(f"Meta API error {status_code} (code {code}): {message}")
+        self.status_code = status_code
+        self.code = code
+        self.message = message
 LEGACY_GEMINI_MODEL_UPGRADES = {
     "gemini-2.5-flash-lite": DEFAULT_GEMINI_MODEL,
 }
@@ -57,6 +66,7 @@ POST_HEADERS = [
     "collected_reply_count",
     "collected_window_start",
     "collected_window_end",
+    "last_full_comment_scan_at",
 ]
 
 COMMENT_HEADERS = [
@@ -208,7 +218,8 @@ CONFIG = {
     "timezone": env_value("TIMEZONE", "UTC"),
     "max_comments_per_run": env_int("MAX_COMMENTS_PER_RUN", 500),
     "max_content_items_per_run": env_int("MAX_CONTENT_ITEMS_PER_RUN", 100),
-    "comments_per_existing_post_coverage": env_int("COMMENTS_PER_EXISTING_POST_COVERAGE", 5),
+    "full_scan_interval_days": env_int("FULL_SCAN_INTERVAL_DAYS", 30),
+    "delta_overlap_hours": env_int("DELTA_OVERLAP_HOURS", 24),
     "max_runtime_seconds": env_int("MAX_RUNTIME_SECONDS", DEFAULT_MAX_RUNTIME_SECONDS),
     "run_started_monotonic": 0.0,
     "run_deadline_monotonic": 0.0,
@@ -465,7 +476,7 @@ def migrate_sheet_headers(
                 for header in desired_headers
             ]
         )
-    zero_answered_scores_in_rows(migrated, desired_headers)
+    zero_brand_thread_scores_in_rows(migrated, desired_headers)
 
     update_values(service, spreadsheet_id, sheet_range(sheet_name, f"A1:{col_letter(len(desired_headers))}1"), [desired_headers])
     if migrated:
@@ -479,90 +490,54 @@ def migrate_sheet_headers(
         clear_values(service, spreadsheet_id, sheet_range(sheet_name, f"{col_letter(len(desired_headers) + 1)}:{col_letter(width)}"))
 
 
-def normalized_person_name(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip().lstrip("@")).casefold()
+def audience_comment_keys_in_brand_threads(comments: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    """Return audience-comment keys connected to an official reply within their post."""
+    parents: dict[tuple[str, str], tuple[str, str]] = {}
 
+    def find(key: tuple[str, str]) -> tuple[str, str]:
+        parents.setdefault(key, key)
+        while parents[key] != key:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
 
-def brand_reply_addresses_commenter(brand_message: Any, commenter_name: Any) -> bool:
-    message = normalized_person_name(brand_message)
-    name = normalized_person_name(commenter_name)
-    if not message or not name or not message.startswith(name):
-        return False
-    return len(message) == len(name) or not message[len(name)].isalnum()
+    def union(first: tuple[str, str], second: tuple[str, str]) -> None:
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parents[second_root] = first_root
 
-
-def answered_audience_comment_ids(comments: list[dict[str, Any]]) -> set[str]:
-    """Resolve direct and unambiguous sibling-thread Greenpeace replies."""
-    prepared: list[tuple[datetime, str, dict[str, Any]]] = []
-    audience_by_key: dict[tuple[str, str], tuple[datetime, dict[str, Any]]] = {}
+    prepared: list[tuple[tuple[str, str], str, dict[str, Any]]] = []
     for comment in comments:
         comment_id = str(comment.get("comment_id") or "")
         post_id = str(comment.get("post_id") or "")
-        created_at = parse_meta_date(str(comment.get("comment_created_time") or ""))
-        if not comment_id or not post_id or not created_at:
+        if not comment_id or not post_id:
             continue
-        prepared.append((created_at, comment_id, comment))
-        if not comment.get("is_brand_comment"):
-            audience_by_key[(post_id, comment_id)] = (created_at, comment)
-
-    answered: set[str] = set()
-
-    # Exact Meta parent linkage remains the strongest signal.
-    for created_at, _, comment in prepared:
-        if not comment.get("is_brand_comment"):
-            continue
-        post_id = str(comment.get("post_id") or "")
+        key = (post_id, comment_id)
+        find(key)
+        prepared.append((key, comment_id, comment))
         parent_id = str(comment.get("parent_comment_id") or "")
-        target = audience_by_key.get((post_id, parent_id))
-        if target and created_at > target[0]:
-            answered.add(parent_id)
+        if parent_id:
+            union(key, (post_id, parent_id))
 
-    # Facebook often represents a reply to a reply as a sibling under the
-    # same root. Match only a single pending audience comment, or an explicit
-    # leading commenter-name mention, to avoid guessing among users.
-    siblings_by_thread: dict[tuple[str, str], list[tuple[datetime, str, dict[str, Any]]]] = defaultdict(list)
-    for item in prepared:
-        comment = item[2]
-        parent_id = str(comment.get("parent_comment_id") or "")
-        if not parent_id:
-            continue
-        siblings_by_thread[(str(comment.get("post_id") or ""), parent_id)].append(item)
-
-    for thread_items in siblings_by_thread.values():
-        pending_audience: list[tuple[datetime, str, dict[str, Any]]] = []
-        for created_at, comment_id, comment in sorted(thread_items, key=lambda item: (item[0], item[1])):
-            if not comment.get("is_brand_comment"):
-                pending_audience.append((created_at, comment_id, comment))
-                continue
-            if not pending_audience:
-                continue
-
-            name_matches = [
-                item
-                for item in pending_audience
-                if brand_reply_addresses_commenter(
-                    comment.get("comment_message", ""),
-                    item[2].get("commenter_name", ""),
-                )
-            ]
-            if name_matches:
-                answered.add(name_matches[-1][1])
-            elif len(pending_audience) == 1:
-                answered.add(pending_audience[0][1])
-            pending_audience.clear()
-
-    return answered
+    brand_thread_roots = {
+        find(key)
+        for key, _, comment in prepared
+        if comment.get("is_brand_comment") and comment.get("parent_comment_id")
+    }
+    return {
+        key
+        for key, _, comment in prepared
+        if not comment.get("is_brand_comment") and find(key) in brand_thread_roots
+    }
 
 
-def zero_answered_scores_in_rows(rows: list[list[Any]], headers: list[str]) -> None:
+def zero_brand_thread_scores_in_rows(rows: list[list[Any]], headers: list[str]) -> None:
     required = {
         "comment_id",
         "post_id",
         "parent_comment_id",
-        "comment_created_time",
-        "commenter_name",
         "is_brand_comment",
-        "comment_message",
         "response_value_score",
     }
     if not required.issubset(headers):
@@ -576,16 +551,17 @@ def zero_answered_scores_in_rows(rows: list[list[Any]], headers: list[str]) -> N
                 "comment_id": str(row[index["comment_id"]] or ""),
                 "post_id": str(row[index["post_id"]] or ""),
                 "parent_comment_id": str(row[index["parent_comment_id"]] or ""),
-                "comment_created_time": str(row[index["comment_created_time"]] or ""),
-                "commenter_name": str(row[index["commenter_name"]] or ""),
                 "is_brand_comment": str(row[index["is_brand_comment"]] or "").strip().lower() == "true",
-                "comment_message": str(row[index["comment_message"]] or ""),
             }
         )
 
-    answered_ids = answered_audience_comment_ids(comments)
+    zero_score_keys = audience_comment_keys_in_brand_threads(comments)
     for row in rows:
-        if str(row[index["comment_id"]] or "") in answered_ids:
+        key = (
+            str(row[index["post_id"]] or ""),
+            str(row[index["comment_id"]] or ""),
+        )
+        if key in zero_score_keys:
             row[index["response_value_score"]] = 0
 
 
@@ -670,8 +646,8 @@ def existing_comment_state(
 def existing_post_state(
     service,
     spreadsheet_id: str,
-) -> tuple[set[str], dict[str, datetime]]:
-    """Load existing post IDs and their last completed comment-scan timestamps."""
+) -> tuple[set[str], dict[str, datetime], list[dict[str, Any]]]:
+    """Load existing post IDs, checkpoints, and scan metadata."""
     rows = get_values(
         service,
         spreadsheet_id,
@@ -679,8 +655,10 @@ def existing_post_state(
     )
     post_id_index = POST_HEADERS.index("post_id")
     window_end_index = POST_HEADERS.index("collected_window_end")
+    full_scan_index = POST_HEADERS.index("last_full_comment_scan_at")
     post_ids: set[str] = set()
     last_scanned: dict[str, datetime] = {}
+    records: list[dict[str, Any]] = []
     for raw_row in rows:
         row = pad_row(raw_row, len(POST_HEADERS))
         post_id = str(row[post_id_index] or "").strip()
@@ -690,7 +668,15 @@ def existing_post_state(
         parsed = parse_meta_date(str(row[window_end_index] or ""))
         if parsed:
             last_scanned[post_id] = parsed
-    return post_ids, last_scanned
+        records.append(
+            {
+                header: row[index]
+                for index, header in enumerate(POST_HEADERS)
+            }
+        )
+        records[-1]["_last_scanned_at"] = parsed
+        records[-1]["_last_full_scan_at"] = parse_meta_date(str(row[full_scan_index] or ""))
+    return post_ids, last_scanned, records
 
 
 def upsert_by_key(
@@ -838,7 +824,11 @@ def fetch_json(url: str) -> dict[str, Any]:
 
     if not response.ok:
         error = data.get("error", {}) if isinstance(data, dict) else {}
-        raise RuntimeError(f"Meta API error {response.status_code}: {error.get('message') or response.text[:500]}")
+        raise MetaAPIError(
+            response.status_code,
+            int(error.get("code") or 0),
+            str(error.get("message") or response.text[:500]),
+        )
     return data
 
 
@@ -1063,58 +1053,80 @@ def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: dat
 
 def fetch_facebook_comments_with_replies(
     object_id: str,
-    since_date: datetime,
+    since_date: datetime | None,
     until_date: datetime,
     access_token: str,
 ):
+    top_level_params: dict[str, Any] = {
+        "fields": FACEBOOK_COMMENT_FIELDS,
+        "filter": "toplevel",
+        "order": "chronological",
+        "until": to_unix(until_date),
+        "limit": 100,
+    }
+    if since_date:
+        top_level_params["since"] = to_unix(since_date)
     comments = get_all_pages(
         f"/{object_id}/comments",
-        {
-            "fields": FACEBOOK_COMMENT_FIELDS,
-            "filter": "toplevel",
-            "order": "chronological",
-            "since": to_unix(since_date),
-            "until": to_unix(until_date),
-            "limit": 100,
-        },
+        top_level_params,
         access_token,
         0,
     )
-    comments = [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
+    if since_date:
+        comments = [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
     for comment in comments:
         if not collection_time_available():
             break
+        reply_params: dict[str, Any] = {
+            "fields": FACEBOOK_COMMENT_FIELDS,
+            "order": "chronological",
+            "until": to_unix(until_date),
+            "limit": 100,
+        }
+        if since_date:
+            reply_params["since"] = to_unix(since_date)
         replies = get_all_pages(
             f"/{comment.get('id', '')}/comments",
-            {
-                "fields": FACEBOOK_COMMENT_FIELDS,
-                "order": "chronological",
-                "since": to_unix(since_date),
-                "until": to_unix(until_date),
-                "limit": 100,
-            },
+            reply_params,
             access_token,
             0,
         )
         comment["comments"] = {
-            "data": [reply for reply in replies if is_within(reply.get("created_time", ""), since_date, until_date)]
+            "data": [
+                reply
+                for reply in replies
+                if not since_date or is_within(reply.get("created_time", ""), since_date, until_date)
+            ]
         }
     return comments
 
 
 def fetch_instagram_comments(
     media_id: str,
-    since_date: datetime,
+    since_date: datetime | None,
     until_date: datetime,
     access_token: str,
 ):
+    fields = "id,text,timestamp,username,like_count"
+    if since_date:
+        fields += ",replies.limit(100){id,text,timestamp,username,like_count}"
     comments = get_all_pages(
         f"/{media_id}/comments",
-        {"fields": "id,text,timestamp,username,like_count", "limit": 100},
+        {"fields": fields, "limit": 100},
         access_token,
         0,
     )
-    comments = [comment for comment in comments if is_within(comment.get("timestamp", ""), since_date, until_date)]
+    if since_date:
+        comments = [
+            comment
+            for comment in comments
+            if is_within(comment.get("timestamp", ""), since_date, until_date)
+            or any(
+                is_within(reply.get("timestamp", ""), since_date, until_date)
+                for reply in comment.get("replies", {}).get("data", [])
+            )
+        ]
+        return comments
     for comment in comments:
         if not collection_time_available():
             break
@@ -1125,7 +1137,11 @@ def fetch_instagram_comments(
             0,
         )
         comment["replies"] = {
-            "data": [reply for reply in replies if is_within(reply.get("timestamp", ""), since_date, until_date)]
+            "data": [
+                reply
+                for reply in replies
+                if not since_date or is_within(reply.get("timestamp", ""), since_date, until_date)
+            ]
         }
     return comments
 
@@ -1296,11 +1312,15 @@ def clear_brand_comment_analysis(comment: dict[str, Any]) -> None:
     comment["response_value_score"] = ""
 
 
-def zero_response_scores_for_answered_comments(comments: list[dict[str, Any]]) -> None:
-    """An already answered comment has no remaining response value."""
-    answered_ids = answered_audience_comment_ids(comments)
+def zero_response_scores_for_brand_threads(comments: list[dict[str, Any]]) -> None:
+    """An audience thread with an official reply has no remaining response value."""
+    zero_score_keys = audience_comment_keys_in_brand_threads(comments)
     for comment in comments:
-        if str(comment.get("comment_id") or "") in answered_ids:
+        key = (
+            str(comment.get("post_id") or ""),
+            str(comment.get("comment_id") or ""),
+        )
+        if key in zero_score_keys:
             comment["response_value_score"] = 0.0
 
 
@@ -1311,7 +1331,7 @@ def collect_visible_comments(
     post_id: str,
     raw_comments: list[dict[str, Any]],
     post_url: str,
-    since_date: datetime,
+    since_date: datetime | None,
     until_date: datetime,
 ) -> None:
     date_field = "created_time" if platform == "facebook" else "timestamp"
@@ -1321,10 +1341,14 @@ def collect_visible_comments(
         if row and row.get("is_brand_comment"):
             clear_brand_comment_analysis(row)
 
+    def in_scan_window(value: str) -> bool:
+        parsed = parse_meta_date(value)
+        return bool(parsed and parsed <= until_date and (not since_date or parsed >= since_date))
+
     for comment in raw_comments:
         if not collection_time_available():
             break
-        if is_within(comment.get(date_field, ""), since_date, until_date):
+        if in_scan_window(comment.get(date_field, "")):
             keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", "", post_url))
 
         replies = sorted(
@@ -1339,7 +1363,7 @@ def collect_visible_comments(
         for reply in replies:
             if not collection_time_available():
                 break
-            if not is_within(reply.get(date_field, ""), since_date, until_date):
+            if not in_scan_window(reply.get(date_field, "")):
                 continue
             structural_parent_id = str(reply.get("parent", {}).get("id") or comment.get("id") or "")
             structural_parent = thread_comments_by_id.get(structural_parent_id, comment)
@@ -1371,18 +1395,13 @@ def select_oldest_comments(comments: list[dict[str, Any]], max_comments: int) ->
     return comments[:max_comments]
 
 
-def select_comments_with_existing_post_coverage(
+def select_comments_fairly(
     comments: list[dict[str, Any]],
     max_comments: int,
-    existing_post_ids: set[str],
-    existing_audience_counts: dict[str, int],
-    per_post_coverage: int,
-) -> tuple[list[dict[str, Any]], int]:
-    """Cover existing posts first, then fill the remaining quota chronologically."""
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Select official replies first, then water-fill audience quota per post."""
     if max_comments < 1:
         raise RuntimeError("MAX_COMMENTS_PER_RUN must be at least 1")
-    if per_post_coverage < 1:
-        raise RuntimeError("COMMENTS_PER_EXISTING_POST_COVERAGE must be at least 1")
 
     chronological = sorted(
         comments,
@@ -1391,54 +1410,46 @@ def select_comments_with_existing_post_coverage(
             str(comment.get("comment_id") or ""),
         ),
     )
-    audience_by_existing_post: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    brand_comments = [comment for comment in chronological if comment.get("is_brand_comment")]
+    selected = brand_comments[:max_comments]
+    brand_selected = len(selected)
+    remaining = max_comments - brand_selected
+    if remaining <= 0:
+        return selected, brand_selected, 0
+
+    audience_by_post: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for comment in chronological:
-        post_id = str(comment.get("post_id") or "")
-        if post_id in existing_post_ids and not comment.get("is_brand_comment"):
-            audience_by_existing_post[post_id].append(comment)
+        if not comment.get("is_brand_comment"):
+            audience_by_post[str(comment.get("post_id") or "")].append(comment)
 
-    prioritized_post_ids = sorted(
-        audience_by_existing_post,
-        key=lambda post_id: (
-            existing_audience_counts.get(post_id, 0),
-            meta_date_sort_key(audience_by_existing_post[post_id][0], "comment_created_time"),
-            post_id,
-        ),
-    )
-    selected: list[dict[str, Any]] = []
-    selected_ids: set[str] = set()
-
-    # Round-robin prevents one busy post from consuming the coverage reserve.
-    for coverage_round in range(per_post_coverage):
-        for post_id in prioritized_post_ids:
-            post_comments = audience_by_existing_post[post_id]
-            if coverage_round >= len(post_comments) or len(selected) >= max_comments:
-                continue
-            comment = post_comments[coverage_round]
-            selected.append(comment)
-            selected_ids.add(str(comment.get("comment_id") or ""))
-        if len(selected) >= max_comments:
+    active = {post_id for post_id, items in audience_by_post.items() if items}
+    audience_posts_selected: set[str] = set()
+    while remaining > 0 and active:
+        if remaining < len(active):
+            newest_posts = sorted(
+                active,
+                key=lambda post_id: (
+                    meta_date_sort_key(audience_by_post[post_id][-1], "comment_created_time"),
+                    post_id,
+                ),
+                reverse=True,
+            )
+            for post_id in newest_posts[:remaining]:
+                selected.append(audience_by_post[post_id].pop())
+                audience_posts_selected.add(post_id)
+            remaining = 0
             break
 
-    coverage_count = len(selected)
-
-    # Strict phase ordering: exhaust unseen comments from existing sheet posts
-    # before any comment belonging to newly discovered content can use capacity.
-    for existing_phase in (True, False):
-        for comment in chronological:
-            if len(selected) >= max_comments:
-                break
-            post_id = str(comment.get("post_id") or "")
-            belongs_to_existing_post = post_id in existing_post_ids
-            if belongs_to_existing_post != existing_phase:
+        share = remaining // len(active)
+        for post_id in sorted(active):
+            take = min(share, len(audience_by_post[post_id]))
+            if not take:
                 continue
-            comment_id = str(comment.get("comment_id") or "")
-            if comment_id in selected_ids:
-                continue
-            selected.append(comment)
-            selected_ids.add(comment_id)
-        if len(selected) >= max_comments:
-            break
+            selected.extend(audience_by_post[post_id][:take])
+            del audience_by_post[post_id][:take]
+            audience_posts_selected.add(post_id)
+            remaining -= take
+        active = {post_id for post_id in active if audience_by_post[post_id]}
 
     selected.sort(
         key=lambda comment: (
@@ -1446,7 +1457,7 @@ def select_comments_with_existing_post_coverage(
             str(comment.get("comment_id") or ""),
         )
     )
-    return selected, coverage_count
+    return selected, brand_selected, len(audience_posts_selected)
 
 
 def content_target_ids(source: str, item: dict[str, Any]) -> set[str]:
@@ -1468,21 +1479,96 @@ def content_target_ids(source: str, item: dict[str, Any]) -> set[str]:
     return {item_id} if item_id else set()
 
 
+def select_existing_scan_jobs(
+    existing_posts: list[dict[str, Any]],
+    capacity: int,
+    now: datetime,
+    full_scan_interval_days: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Reserve a daily full-audit slice, then fill by oldest delta checkpoint."""
+    if capacity <= 0 or not existing_posts:
+        return [], 0, 0
+    if full_scan_interval_days < 1:
+        raise RuntimeError("FULL_SCAN_INTERVAL_DAYS must be at least 1")
+
+    never = datetime.min.replace(tzinfo=timezone.utc)
+    valid = [
+        dict(post)
+        for post in existing_posts
+        if post.get("post_id") and str(post.get("platform") or "").lower() in {"facebook", "instagram"}
+    ]
+    if not valid:
+        return [], 0, 0
+
+    cutoff = now - timedelta(days=full_scan_interval_days)
+    due = [
+        post
+        for post in valid
+        if not post.get("_last_full_scan_at") or post["_last_full_scan_at"] <= cutoff
+    ]
+    due.sort(
+        key=lambda post: (
+            post.get("_last_full_scan_at") or never,
+            meta_date_sort_key(post, "post_created_time"),
+            str(post.get("post_id") or ""),
+        )
+    )
+    audit_target = max(1, math.ceil(len(valid) / full_scan_interval_days))
+    audit_jobs = due[: min(capacity, audit_target)]
+    selected_ids = {str(post.get("post_id") or "") for post in audit_jobs}
+    for post in audit_jobs:
+        post["_full_scan"] = True
+
+    remaining_capacity = capacity - len(audit_jobs)
+    delta_candidates = [
+        post for post in valid if str(post.get("post_id") or "") not in selected_ids
+    ]
+    delta_candidates.sort(
+        key=lambda post: (
+            post.get("_last_scanned_at") or never,
+            meta_date_sort_key(post, "post_created_time"),
+            str(post.get("post_id") or ""),
+        )
+    )
+    delta_jobs = delta_candidates[:remaining_capacity]
+    for post in delta_jobs:
+        post["_full_scan"] = False
+    return [*audit_jobs, *delta_jobs], len(audit_jobs), len(due)
+
+
 def collect_rows(
     existing_post_ids: set[str] | None = None,
     existing_comment_ids: set[str] | None = None,
     existing_audience_counts: dict[str, int] | None = None,
     existing_post_last_scanned: dict[str, datetime] | None = None,
+    existing_posts: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     existing_post_ids = existing_post_ids or set()
     existing_comment_ids = existing_comment_ids or set()
-    existing_audience_counts = existing_audience_counts or {}
     existing_post_last_scanned = existing_post_last_scanned or {}
+    existing_posts = existing_posts or []
+    if not existing_posts:
+        existing_posts = [
+            {
+                "post_id": post_id,
+                "platform": "",
+                "_last_scanned_at": existing_post_last_scanned.get(post_id),
+                "_last_full_scan_at": None,
+            }
+            for post_id in existing_post_ids
+        ]
+
     access_token = meta_access_token()
     window_start, window_end = collection_window()
+    full_scan_interval_days = CONFIG["full_scan_interval_days"]
+    overlap_hours = CONFIG["delta_overlap_hours"]
+    if full_scan_interval_days < 1:
+        raise RuntimeError("FULL_SCAN_INTERVAL_DAYS must be at least 1")
+    if overlap_hours < 0:
+        raise RuntimeError("DELTA_OVERLAP_HOURS must be zero or greater")
     log_progress(
         "meta",
-        f"Collection window: {window_start.isoformat()} to {window_end.isoformat()}; discovering accounts",
+        f"Discovery window: {window_start.isoformat()} to {window_end.isoformat()}; discovering accounts",
     )
     meta_context = discover_meta_context(access_token)
     log_progress(
@@ -1500,24 +1586,36 @@ def collect_rows(
     seen_comments: set[str] = set(existing_comment_ids)
     max_comments = CONFIG["max_comments_per_run"]
     max_content_items = CONFIG["max_content_items_per_run"]
-    per_post_coverage = CONFIG["comments_per_existing_post_coverage"]
     if max_content_items < 1:
         raise RuntimeError("MAX_CONTENT_ITEMS_PER_RUN must be at least 1")
     processed_content_items = 0
 
-    def can_process_content() -> bool:
-        return processed_content_items < max_content_items and collection_time_available()
-
-    def register_post(post_row: dict[str, Any]) -> None:
+    def register_new_post(post_row: dict[str, Any]) -> None:
         post_id = str(post_row.get("post_id") or "")
         if not post_id:
             return
+        post_row["_full_scan"] = True
         scanned_posts[post_id] = post_row
         if post_id not in existing_post_ids and post_id not in new_post_ids:
             posts.append(post_row)
             new_post_ids.add(post_id)
 
-    log_progress("collect", f"Loading content lists; global content limit={max_content_items}")
+    def comments_for_post(post_id: str) -> list[dict[str, Any]]:
+        return [comment for comment in comments if str(comment.get("post_id") or "") == post_id]
+
+    def terminal_object_error(exc: MetaAPIError) -> bool:
+        message = exc.message.casefold()
+        return exc.status_code == 404 or any(
+            phrase in message
+            for phrase in (
+                "unsupported get request",
+                "does not exist",
+                "cannot be loaded",
+                "object not found",
+            )
+        )
+
+    log_progress("collect", f"Loading discovery lists; global content limit={max_content_items}")
     facebook_posts = fetch_facebook_posts(meta_context["page_id"], window_start, window_end, window_start, page_token)
     instagram_media = (
         fetch_instagram_media(meta_context["ig_user_id"], window_start, window_end, access_token)
@@ -1543,53 +1641,13 @@ def collect_rows(
     content_candidates.extend(
         ("ad", ad, "created_time")
         for ad in ads
-        if ad.get("id")
+        if ad.get("id") and content_target_ids("ad", ad)
     )
-
-    never_scanned = datetime.min.replace(tzinfo=timezone.utc)
-
-    def candidate_existing_targets(candidate: tuple[str, dict[str, Any], str]) -> set[str]:
-        return content_target_ids(candidate[0], candidate[1]) & existing_post_ids
-
-    def candidate_last_scanned(candidate: tuple[str, dict[str, Any], str]) -> datetime:
-        targets = candidate_existing_targets(candidate)
-        return min(
-            (existing_post_last_scanned.get(post_id, never_scanned) for post_id in targets),
-            default=never_scanned,
-        )
-
-    def existing_content_priority(candidate: tuple[str, dict[str, Any], str]) -> tuple[Any, ...]:
-        source, item, date_field = candidate
-        existing_targets = candidate_existing_targets(candidate)
-        stored_audience_count = (
-            min(existing_audience_counts.get(post_id, 0) for post_id in existing_targets)
-            if existing_targets
-            else 0
-        )
-        return (
-            candidate_last_scanned(candidate),
-            stored_audience_count,
-            meta_date_sort_key(item, date_field),
-            source,
-            str(item.get("id") or ""),
-        )
-
-    existing_candidates = [
-        candidate for candidate in content_candidates if candidate_existing_targets(candidate)
-    ]
     new_candidates = [
-        candidate for candidate in content_candidates if not candidate_existing_targets(candidate)
-    ]
-    oldest_existing_scan = min(
-        (candidate_last_scanned(candidate) for candidate in existing_candidates),
-        default=None,
-    )
-    pending_existing = [
         candidate
-        for candidate in existing_candidates
-        if candidate_last_scanned(candidate) == oldest_existing_scan
+        for candidate in content_candidates
+        if content_target_ids(candidate[0], candidate[1]) - existing_post_ids
     ]
-    pending_existing.sort(key=existing_content_priority)
     new_candidates.sort(
         key=lambda candidate: (
             meta_date_sort_key(candidate[1], candidate[2]),
@@ -1598,243 +1656,295 @@ def collect_rows(
         )
     )
 
-    # Strict queue: only the oldest not-yet-completed existing scan cohort is
-    # considered first. New content can use capacity only after that cohort fits.
-    content_queue = [*pending_existing, *new_candidates]
-    selected_content: list[tuple[str, dict[str, Any], str]] = []
+    selected_new: list[tuple[str, dict[str, Any], str]] = []
     selected_target_ids: set[str] = set()
-    for candidate in content_queue:
-        targets = content_target_ids(candidate[0], candidate[1])
-        if targets and targets.issubset(selected_target_ids):
+    for candidate in new_candidates:
+        new_targets = content_target_ids(candidate[0], candidate[1]) - existing_post_ids
+        if not new_targets or new_targets.issubset(selected_target_ids):
             continue
-        selected_content.append(candidate)
-        selected_target_ids.update(targets)
-        if len(selected_content) >= max_content_items:
+        selected_new.append(candidate)
+        selected_target_ids.update(new_targets)
+        if len(selected_new) >= max_content_items:
             break
     selected_facebook_ids = {
         str(item.get("id") or "")
-        for source, item, _ in selected_content
+        for source, item, _ in selected_new
         if source == "facebook"
     }
     selected_instagram_ids = {
         str(item.get("id") or "")
-        for source, item, _ in selected_content
+        for source, item, _ in selected_new
         if source == "instagram"
     }
     selected_ad_ids = {
         str(item.get("id") or "")
-        for source, item, _ in selected_content
+        for source, item, _ in selected_new
         if source == "ad"
     }
-    selected_existing_count = sum(
-        1
-        for source, item, _ in selected_content
-        if content_target_ids(source, item) & existing_post_ids
+
+    existing_capacity = max_content_items - len(selected_new)
+    existing_jobs, scheduled_full_audits, full_audit_backlog = select_existing_scan_jobs(
+        existing_posts,
+        existing_capacity,
+        window_end,
+        full_scan_interval_days,
     )
     log_progress(
         "collect",
-        f"Content candidates={len(content_candidates)}, selected={len(selected_content)}, "
-        f"existing_candidates={len(existing_candidates)}, pending_existing_cohort={len(pending_existing)}, "
-        f"existing_first={selected_existing_count}, new_after_existing={len(selected_content) - selected_existing_count} "
+        f"Discovery candidates={len(content_candidates)}, unseen_candidates={len(new_candidates)}, "
+        f"selected_new={len(selected_new)}, selected_existing={len(existing_jobs)}, "
+        f"scheduled_full_audits={scheduled_full_audits}, full_audit_backlog={full_audit_backlog} "
         f"(facebook={len(selected_facebook_ids)}, instagram={len(selected_instagram_ids)}, ads={len(selected_ad_ids)})",
     )
 
-    for post in facebook_posts:
-        if str(post.get("id") or "") not in selected_facebook_ids:
-            continue
-        if not can_process_content():
+    # Iterate the selected FIFO list itself so cross-platform deadline behavior
+    # preserves the same oldest-first order used during selection.
+    for source, item, _ in selected_new:
+        if not collection_time_available():
             break
-        post_id = post.get("id", "")
-        if not post_id:
-            continue
         processed_content_items += 1
         comments_before = len(comments)
-        scanned_content_ids.add(post_id)
-        post_comments = fetch_facebook_comments_with_replies(post_id, window_start, window_end, page_token)
-        collect_visible_comments(
-            comments,
-            seen_comments,
-            "facebook",
-            post_id,
-            post_comments,
-            post.get("permalink_url", ""),
-            window_start,
-            window_end,
-        )
-        register_post(
-            make_post_row(
-                post_id=post_id,
-                platform="facebook",
-                created_time=post.get("created_time", ""),
-                message=post.get("message", ""),
-                url=post.get("permalink_url", ""),
-                source_type="organic",
-                campaign_name="",
-                ad_id="",
-                media_type=media_type_from_facebook(post),
-                like_count=first_summary_total(post, "reactions") or first_summary_total(post, "likes"),
-                collected_window_start=window_start,
-                collected_window_end=window_end,
-                comments=[comment for comment in comments if comment["post_id"] == post_id],
-            )
-        )
-        log_progress(
-            "collect",
-            f"Facebook item {processed_content_items}/{max_content_items}: id={post_id}, "
-            f"existing={post_id in existing_post_ids}, new_comments={len(comments) - comments_before}",
-        )
+        scan_complete = True
 
-    for media in instagram_media:
-        if str(media.get("id") or "") not in selected_instagram_ids:
-            continue
-        if not can_process_content():
-            break
-        post_id = media.get("id", "")
-        if not post_id:
-            continue
-        processed_content_items += 1
-        comments_before = len(comments)
-        scanned_content_ids.add(post_id)
-        post_comments = fetch_instagram_comments(post_id, window_start, window_end, access_token)
-        collect_visible_comments(
-            comments,
-            seen_comments,
-            "instagram",
-            post_id,
-            post_comments,
-            media.get("permalink", ""),
-            window_start,
-            window_end,
-        )
-        register_post(
-            make_post_row(
-                post_id=post_id,
-                platform="instagram",
-                created_time=media.get("timestamp", ""),
-                message=media.get("caption", ""),
-                url=media.get("permalink", ""),
-                source_type="organic",
-                campaign_name="",
-                ad_id="",
-                media_type=media_type_from_instagram(media),
-                like_count=media.get("like_count", 0),
-                collected_window_start=window_start,
-                collected_window_end=window_end,
-                comments=[comment for comment in comments if comment["post_id"] == post_id],
-            )
-        )
-        log_progress(
-            "collect",
-            f"Instagram item {processed_content_items}/{max_content_items}: id={post_id}, "
-            f"existing={post_id in existing_post_ids}, new_comments={len(comments) - comments_before}",
-        )
-
-    for ad in ads:
-        if str(ad.get("id") or "") not in selected_ad_ids:
-            continue
-        if not can_process_content():
-            break
-        processed_content_items += 1
-        comments_before = len(comments)
-        creative = ad.get("creative", {})
-        campaign_name = ad.get("campaign", {}).get("name", "")
-        ad_id = ad.get("id", "")
-        if creative.get("effective_object_story_id"):
-            object_id = creative["effective_object_story_id"]
-            if object_id not in scanned_content_ids:
-                scanned_content_ids.add(object_id)
-                ad_post = fetch_facebook_object(object_id, page_token)
-                if is_within(ad_post.get("created_time", ""), window_start, window_end):
-                    ad_comments = fetch_facebook_comments_with_replies(
-                        object_id,
-                        window_start,
-                        window_end,
-                        page_token,
-                    )
-                    collect_visible_comments(
-                        comments,
-                        seen_comments,
-                        "facebook",
-                        object_id,
-                        ad_comments,
-                        ad_post.get("permalink_url", ""),
-                        window_start,
-                        window_end,
-                    )
-                    register_post(
+        if source == "facebook":
+            post_id = str(item.get("id") or "")
+            if post_id and post_id not in existing_post_ids and post_id not in scanned_content_ids:
+                scanned_content_ids.add(post_id)
+                post_comments = fetch_facebook_comments_with_replies(post_id, None, window_end, page_token)
+                collect_visible_comments(
+                    comments, seen_comments, "facebook", post_id, post_comments,
+                    item.get("permalink_url", ""), None, window_end,
+                )
+                scan_complete = collection_time_available()
+                if scan_complete:
+                    register_new_post(
                         make_post_row(
-                            post_id=object_id,
+                            post_id=post_id,
                             platform="facebook",
-                            created_time=ad_post.get("created_time", ""),
-                            message=ad_post.get("message", ""),
-                            url=ad_post.get("permalink_url", ""),
-                            source_type="paid",
-                            campaign_name=campaign_name,
-                            ad_id=ad_id,
-                            media_type=media_type_from_facebook(ad_post),
-                            like_count=first_summary_total(ad_post, "reactions") or first_summary_total(ad_post, "likes"),
-                            collected_window_start=window_start,
+                            created_time=item.get("created_time", ""),
+                            message=item.get("message", ""),
+                            url=item.get("permalink_url", ""),
+                            source_type="organic",
+                            campaign_name="",
+                            ad_id="",
+                            media_type=media_type_from_facebook(item),
+                            like_count=first_summary_total(item, "reactions") or first_summary_total(item, "likes"),
+                            collected_window_start=parse_meta_date(str(item.get("created_time") or "")) or window_start,
                             collected_window_end=window_end,
-                            comments=[comment for comment in comments if comment["post_id"] == object_id],
+                            comments=comments_for_post(post_id),
+                            last_full_comment_scan_at=None,
                         )
                     )
-        if creative.get("effective_instagram_media_id"):
-            media_id = creative["effective_instagram_media_id"]
-            if media_id not in scanned_content_ids:
-                scanned_content_ids.add(media_id)
-                ad_media = fetch_instagram_media_by_id(media_id, access_token)
-                if is_within(ad_media.get("timestamp", ""), window_start, window_end):
-                    ad_comments = fetch_instagram_comments(media_id, window_start, window_end, access_token)
-                    collect_visible_comments(
-                        comments,
-                        seen_comments,
-                        "instagram",
-                        media_id,
-                        ad_comments,
-                        ad_media.get("permalink", ""),
-                        window_start,
-                        window_end,
-                    )
-                    register_post(
+
+        elif source == "instagram":
+            post_id = str(item.get("id") or "")
+            if post_id and post_id not in existing_post_ids and post_id not in scanned_content_ids:
+                scanned_content_ids.add(post_id)
+                post_comments = fetch_instagram_comments(post_id, None, window_end, access_token)
+                collect_visible_comments(
+                    comments, seen_comments, "instagram", post_id, post_comments,
+                    item.get("permalink", ""), None, window_end,
+                )
+                scan_complete = collection_time_available()
+                if scan_complete:
+                    register_new_post(
                         make_post_row(
-                            post_id=media_id,
+                            post_id=post_id,
                             platform="instagram",
-                            created_time=ad_media.get("timestamp", ""),
-                            message=ad_media.get("caption", ""),
-                            url=ad_media.get("permalink", ""),
-                            source_type="paid",
-                            campaign_name=campaign_name,
-                            ad_id=ad_id,
-                            media_type=media_type_from_instagram(ad_media),
-                            like_count=ad_media.get("like_count", 0),
-                            collected_window_start=window_start,
+                            created_time=item.get("timestamp", ""),
+                            message=item.get("caption", ""),
+                            url=item.get("permalink", ""),
+                            source_type="organic",
+                            campaign_name="",
+                            ad_id="",
+                            media_type=media_type_from_instagram(item),
+                            like_count=item.get("like_count", 0),
+                            collected_window_start=parse_meta_date(str(item.get("timestamp") or "")) or window_start,
                             collected_window_end=window_end,
-                            comments=[comment for comment in comments if comment["post_id"] == media_id],
+                            comments=comments_for_post(post_id),
+                            last_full_comment_scan_at=None,
                         )
                     )
+
+        else:
+            creative = item.get("creative", {})
+            campaign_name = item.get("campaign", {}).get("name", "")
+            ad_id = str(item.get("id") or "")
+            object_id = str(creative.get("effective_object_story_id") or "")
+            if object_id and object_id not in existing_post_ids and object_id not in scanned_content_ids:
+                scanned_content_ids.add(object_id)
+                try:
+                    ad_post = fetch_facebook_object(object_id, page_token)
+                    ad_comments = fetch_facebook_comments_with_replies(object_id, None, window_end, page_token)
+                    collect_visible_comments(
+                        comments, seen_comments, "facebook", object_id, ad_comments,
+                        ad_post.get("permalink_url", ""), None, window_end,
+                    )
+                    scan_complete = collection_time_available()
+                    if scan_complete:
+                        register_new_post(
+                            make_post_row(
+                                post_id=object_id,
+                                platform="facebook",
+                                created_time=ad_post.get("created_time", ""),
+                                message=ad_post.get("message", ""),
+                                url=ad_post.get("permalink_url", ""),
+                                source_type="paid",
+                                campaign_name=campaign_name,
+                                ad_id=ad_id,
+                                media_type=media_type_from_facebook(ad_post),
+                                like_count=first_summary_total(ad_post, "reactions") or first_summary_total(ad_post, "likes"),
+                                collected_window_start=parse_meta_date(str(ad_post.get("created_time") or "")) or window_start,
+                                collected_window_end=window_end,
+                                comments=comments_for_post(object_id),
+                                last_full_comment_scan_at=None,
+                            )
+                        )
+                except MetaAPIError as exc:
+                    log_progress("meta", f"Skipping new Facebook ad object {object_id}: {exc}")
+
+            media_id = str(creative.get("effective_instagram_media_id") or "")
+            if scan_complete and media_id and media_id not in existing_post_ids and media_id not in scanned_content_ids:
+                scanned_content_ids.add(media_id)
+                try:
+                    ad_media = fetch_instagram_media_by_id(media_id, access_token)
+                    ad_comments = fetch_instagram_comments(media_id, None, window_end, access_token)
+                    collect_visible_comments(
+                        comments, seen_comments, "instagram", media_id, ad_comments,
+                        ad_media.get("permalink", ""), None, window_end,
+                    )
+                    scan_complete = collection_time_available()
+                    if scan_complete:
+                        register_new_post(
+                            make_post_row(
+                                post_id=media_id,
+                                platform="instagram",
+                                created_time=ad_media.get("timestamp", ""),
+                                message=ad_media.get("caption", ""),
+                                url=ad_media.get("permalink", ""),
+                                source_type="paid",
+                                campaign_name=campaign_name,
+                                ad_id=ad_id,
+                                media_type=media_type_from_instagram(ad_media),
+                                like_count=ad_media.get("like_count", 0),
+                                collected_window_start=parse_meta_date(str(ad_media.get("timestamp") or "")) or window_start,
+                                collected_window_end=window_end,
+                                comments=comments_for_post(media_id),
+                                last_full_comment_scan_at=None,
+                            )
+                        )
+                except MetaAPIError as exc:
+                    log_progress("meta", f"Skipping new Instagram ad object {media_id}: {exc}")
+
+        if not scan_complete:
+            log_progress("deadline", f"Holding incomplete full scan for new {source} item {item.get('id', '')}")
+            break
         log_progress(
             "collect",
-            f"Ad item {processed_content_items}/{max_content_items}: ad_id={ad_id}, "
+            f"New {source} item {processed_content_items}/{max_content_items}: id={item.get('id', '')}, "
             f"new_comments={len(comments) - comments_before}",
         )
+
+    # Existing posts are independent of the discovery lookback and are fetched
+    # directly from IDs and platforms stored in the sheet.
+    delta_scans = 0
+    full_scans = 0
+    terminal_unavailable = 0
+    for job in existing_jobs:
+        if not collection_time_available():
+            break
+        post_id = str(job.get("post_id") or "")
+        platform = str(job.get("platform") or "").lower()
+        if not post_id or platform not in {"facebook", "instagram"}:
+            continue
+        full_scan = bool(job.get("_full_scan")) or not job.get("_last_scanned_at")
+        scan_start = None
+        if not full_scan:
+            scan_start = job["_last_scanned_at"] - timedelta(hours=overlap_hours)
+        try:
+            raw_comments = (
+                fetch_facebook_comments_with_replies(post_id, scan_start, window_end, page_token)
+                if platform == "facebook"
+                else fetch_instagram_comments(post_id, scan_start, window_end, access_token)
+            )
+        except MetaAPIError as exc:
+            if terminal_object_error(exc):
+                terminal_unavailable += 1
+                unavailable = dict(job)
+                unavailable.update(
+                    {
+                        "collected_window_start": window_end.isoformat(),
+                        "collected_window_end": window_end.isoformat(),
+                        "_new_comment_ids": set(),
+                        "_full_scan": True,
+                        "_terminal_unavailable": True,
+                    }
+                )
+                scanned_posts[post_id] = unavailable
+                log_progress("meta", f"Deferring inaccessible {platform} object {post_id} for one audit cycle: {exc}")
+                continue
+            log_progress("meta", f"Transient scan failure for {platform} object {post_id}; checkpoint held: {exc}")
+            continue
+
+        comments_before = len(comments)
+        collect_visible_comments(
+            comments,
+            seen_comments,
+            platform,
+            post_id,
+            raw_comments,
+            str(job.get("post_url") or ""),
+            scan_start,
+            window_end,
+        )
+        if not collection_time_available():
+            log_progress("deadline", f"Holding incomplete scan checkpoint for {platform} object {post_id}")
+            break
+        new_ids = {
+            str(comment.get("comment_id") or "")
+            for comment in comments[comments_before:]
+            if comment.get("comment_id")
+        }
+        scanned = dict(job)
+        scanned.update(
+            {
+                "collected_window_start": (
+                    scan_start.isoformat()
+                    if scan_start
+                    else str(job.get("post_created_time") or window_start.isoformat())
+                ),
+                "collected_window_end": window_end.isoformat(),
+                "_new_comment_ids": new_ids,
+                "_full_scan": full_scan,
+            }
+        )
+        scanned_posts[post_id] = scanned
+        full_scans += int(full_scan)
+        delta_scans += int(not full_scan)
+        processed_content_items += 1
+        log_progress(
+            "collect",
+            f"Existing {platform} item {post_id}: mode={'full' if full_scan else 'delta'}, "
+            f"new_comments={len(new_ids)}",
+        )
+
     candidate_count = len(comments)
-    selected_comments, coverage_count = select_comments_with_existing_post_coverage(
-        comments,
-        max_comments,
-        existing_post_ids,
-        existing_audience_counts,
-        per_post_coverage,
-    )
+    selected_comments, brand_selected, audience_posts_selected = select_comments_fairly(comments, max_comments)
     deferred_count = candidate_count - len(selected_comments)
     print(
         "New comment candidates: "
         f"found={candidate_count}, selected={len(selected_comments)}, deferred={deferred_count}, "
-        f"existing_post_coverage_selected={coverage_count}, coverage_per_post={per_post_coverage}, "
+        f"brand_selected_first={brand_selected}, audience_posts_selected={audience_posts_selected}, "
         f"limit={max_comments}."
+    )
+    log_progress(
+        "collect",
+        f"Scan modes: new_full={len(posts)}, existing_full={full_scans}, existing_delta={delta_scans}, "
+        f"terminal_unavailable={terminal_unavailable}, audit_backlog={full_audit_backlog}",
     )
     if not collection_time_available():
         log_progress("deadline", "Collection stopped early to reserve time for Gemini analysis and Sheets writes")
-    elif processed_content_items >= max_content_items:
+    elif len(selected_new) + len(existing_jobs) >= max_content_items:
         log_progress("collect", f"Reached global content-item limit of {max_content_items}")
     return posts, selected_comments, list(scanned_posts.values())
 
@@ -1853,6 +1963,7 @@ def make_post_row(
     collected_window_start: datetime,
     collected_window_end: datetime,
     comments: list[dict[str, Any]],
+    last_full_comment_scan_at: datetime | None,
 ) -> dict[str, Any]:
     reply_count = sum(1 for comment in comments if comment.get("parent_comment_id"))
     return {
@@ -1876,6 +1987,9 @@ def make_post_row(
         "collected_reply_count": reply_count,
         "collected_window_start": collected_window_start.isoformat(),
         "collected_window_end": collected_window_end.isoformat(),
+        "last_full_comment_scan_at": (
+            last_full_comment_scan_at.isoformat() if last_full_comment_scan_at else ""
+        ),
         "post_emotions": ["Neutral"],
         "post_sentiment": "neutral",
         # Ephemeral checkpoint data; not part of POST_HEADERS.
@@ -2385,7 +2499,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
         )
         completed_comments.extend(batch)
 
-    zero_response_scores_for_answered_comments(completed_comments)
+    zero_response_scores_for_brand_threads(completed_comments)
     return completed_comments
 
 
@@ -2474,7 +2588,7 @@ def rate(count: int, total: int) -> float:
     return round(count / total, 4) if total else 0.0
 
 
-def reconcile_answered_response_scores(service, spreadsheet_id: str) -> int:
+def reconcile_brand_thread_response_scores(service, spreadsheet_id: str) -> int:
     raw_rows = get_values(
         service,
         spreadsheet_id,
@@ -2485,7 +2599,7 @@ def reconcile_answered_response_scores(service, spreadsheet_id: str) -> int:
     rows = [pad_row(row, len(COMMENT_HEADERS)) for row in raw_rows]
     score_index = COMMENT_HEADERS.index("response_value_score")
     previous_scores = [row[score_index] for row in rows]
-    zero_answered_scores_in_rows(rows, COMMENT_HEADERS)
+    zero_brand_thread_scores_in_rows(rows, COMMENT_HEADERS)
     changed = 0
     updates: list[dict[str, Any]] = []
     score_column = score_index + 1
@@ -2595,6 +2709,7 @@ def update_scanned_post_checkpoints(
     }
     start_column = POST_HEADERS.index("collected_window_start") + 1
     end_column = POST_HEADERS.index("collected_window_end") + 1
+    full_scan_column = POST_HEADERS.index("last_full_comment_scan_at") + 1
     updates: list[dict[str, Any]] = []
     incomplete = 0
     for post in scanned_posts:
@@ -2619,8 +2734,27 @@ def update_scanned_post_checkpoints(
                 "values": [[post.get("collected_window_start", ""), post.get("collected_window_end", "")]],
             }
         )
+        if post.get("_full_scan"):
+            updates.append(
+                {
+                    "range": sheet_range(
+                        POSTS_SHEET_NAME,
+                        f"{col_letter(full_scan_column)}{sheet_row}",
+                    ),
+                    "values": [[post.get("collected_window_end", "")]],
+                }
+            )
     batch_update_values(service, spreadsheet_id, updates)
-    return len(updates), incomplete
+    return sum(
+        1
+        for post in scanned_posts
+        if str(post.get("post_id") or "") in sheet_row_by_post_id
+        and {
+            str(comment_id)
+            for comment_id in post.get("_new_comment_ids", set())
+            if comment_id
+        }.issubset(completed_comment_ids)
+    ), incomplete
 
 
 def sync() -> None:
@@ -2630,7 +2764,8 @@ def sync() -> None:
         f"Starting sync: lookback_days={CONFIG['lookback_days']}, "
         f"content_limit={CONFIG['max_content_items_per_run']}, "
         f"comment_limit={CONFIG['max_comments_per_run']}, "
-        f"existing_post_coverage={CONFIG['comments_per_existing_post_coverage']}, "
+        f"full_scan_interval_days={CONFIG['full_scan_interval_days']}, "
+        f"delta_overlap_hours={CONFIG['delta_overlap_hours']}, "
         f"runtime_limit={CONFIG['max_runtime_seconds']}s, "
         f"gemini_batch_size={CONFIG['analysis_batch_size']}",
     )
@@ -2640,7 +2775,7 @@ def sync() -> None:
     ensure_schema(service, spreadsheet_id)
     log_progress("sheets", f"Using spreadsheet {spreadsheet_id}")
 
-    known_post_ids, existing_post_last_scanned = existing_post_state(service, spreadsheet_id)
+    known_post_ids, existing_post_last_scanned, existing_posts = existing_post_state(service, spreadsheet_id)
     known_comment_ids, existing_audience_counts = existing_comment_state(service, spreadsheet_id)
     log_progress(
         "sheets",
@@ -2654,6 +2789,7 @@ def sync() -> None:
         known_comment_ids,
         existing_audience_counts,
         existing_post_last_scanned,
+        existing_posts,
     )
     if env_bool("ANALYZE_WITH_GEMINI", True):
         discovered_post_count = len(posts)
@@ -2712,15 +2848,15 @@ def sync() -> None:
     )
     log_progress(
         "sheets",
-        f"Existing-first queue checkpoints advanced={checkpointed_posts}, "
+        f"Scan checkpoints advanced={checkpointed_posts}, "
         f"held_for_deferred_or_unanalyzed_comments={incomplete_post_scans}",
     )
-    zeroed_scores = reconcile_answered_response_scores(service, spreadsheet_id)
+    zeroed_scores = reconcile_brand_thread_response_scores(service, spreadsheet_id)
     refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
     log_progress(
         "complete",
         f"Synced {len(posts)} new posts and {len(comments)} new comments/replies. "
-        f"Zeroed {zeroed_scores} answered response scores and refreshed "
+        f"Zeroed {zeroed_scores} response scores in brand-participated threads and refreshed "
         f"{refreshed_posts} post counters / {refreshed_summaries} summaries.",
     )
 
