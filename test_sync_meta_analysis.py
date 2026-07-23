@@ -349,6 +349,112 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
 
         self.assertEqual(comments[0]["response_value_score"], 0.0)
 
+    def test_later_brand_sibling_zeros_only_pending_audience_comment(self):
+        comments = [
+            {
+                "comment_id": "audience-sibling",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:09:00+00:00",
+                "commenter_name": "",
+                "comment_message": "What does Greenpeace say about this?",
+                "is_brand_comment": False,
+                "response_value_score": 0.85,
+            },
+            {
+                "comment_id": "brand-sibling",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:33:00+00:00",
+                "commenter_name": "Greenpeace Israel",
+                "comment_message": "Meirav, our position is clear.",
+                "is_brand_comment": True,
+                "response_value_score": "",
+            },
+        ]
+
+        sync.zero_response_scores_for_answered_comments(comments)
+
+        self.assertEqual(comments[0]["response_value_score"], 0.0)
+
+    def test_brand_sibling_uses_leading_name_when_multiple_users_are_pending(self):
+        comments = [
+            {
+                "comment_id": "dana-comment",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:00:00+00:00",
+                "commenter_name": "Dana Cohen",
+                "comment_message": "First question",
+                "is_brand_comment": False,
+                "response_value_score": 0.8,
+            },
+            {
+                "comment_id": "meirav-comment",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:09:00+00:00",
+                "commenter_name": "Meirav Zmora Katz",
+                "comment_message": "Second question",
+                "is_brand_comment": False,
+                "response_value_score": 0.85,
+            },
+            {
+                "comment_id": "brand-sibling",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:33:00+00:00",
+                "commenter_name": "Greenpeace Israel",
+                "comment_message": "Meirav Zmora Katz our position is clear.",
+                "is_brand_comment": True,
+                "response_value_score": "",
+            },
+        ]
+
+        sync.zero_response_scores_for_answered_comments(comments)
+
+        self.assertEqual(comments[0]["response_value_score"], 0.8)
+        self.assertEqual(comments[1]["response_value_score"], 0.0)
+
+    def test_ambiguous_brand_sibling_does_not_guess_between_multiple_users(self):
+        comments = [
+            {
+                "comment_id": "first",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:00:00+00:00",
+                "commenter_name": "First User",
+                "comment_message": "First question",
+                "is_brand_comment": False,
+                "response_value_score": 0.8,
+            },
+            {
+                "comment_id": "second",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:09:00+00:00",
+                "commenter_name": "Second User",
+                "comment_message": "Second question",
+                "is_brand_comment": False,
+                "response_value_score": 0.85,
+            },
+            {
+                "comment_id": "brand",
+                "post_id": "post",
+                "parent_comment_id": "thread-root",
+                "comment_created_time": "2026-07-02T13:33:00+00:00",
+                "commenter_name": "Greenpeace Israel",
+                "comment_message": "Here is our general position.",
+                "is_brand_comment": True,
+                "response_value_score": "",
+            },
+        ]
+
+        sync.zero_response_scores_for_answered_comments(comments)
+
+        self.assertEqual(comments[0]["response_value_score"], 0.8)
+        self.assertEqual(comments[1]["response_value_score"], 0.85)
+
     def test_meta_pagination_continues_until_no_next_page(self):
         pages = [
             {"data": [{"id": "1"}], "paging": {"next": "https://next-page"}},
