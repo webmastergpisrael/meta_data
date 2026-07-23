@@ -19,6 +19,7 @@ RECOMMENDED_RESPONSE_SCORE_THRESHOLD = 0.70
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 WRITE_RESERVE_SECONDS = 90
 ANALYSIS_RESERVE_SECONDS = 4 * 60
+SHEETS_API_RETRIES = 3
 
 
 class DeadlineReached(RuntimeError):
@@ -310,7 +311,7 @@ def get_spreadsheet(service, spreadsheet_id: str) -> dict[str, Any]:
     return (
         service.spreadsheets()
         .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title))")
-        .execute()
+        .execute(num_retries=SHEETS_API_RETRIES)
     )
 
 
@@ -328,7 +329,7 @@ def update_values(service, spreadsheet_id: str, range_name: str, values: list[li
         range=range_name,
         valueInputOption="RAW",
         body={"values": values},
-    ).execute()
+    ).execute(num_retries=SHEETS_API_RETRIES)
 
 
 def batch_update_values(service, spreadsheet_id: str, updates: list[dict[str, Any]]) -> None:
@@ -337,11 +338,16 @@ def batch_update_values(service, spreadsheet_id: str, updates: list[dict[str, An
     service.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={"valueInputOption": "RAW", "data": updates},
-    ).execute()
+    ).execute(num_retries=SHEETS_API_RETRIES)
 
 
 def get_values(service, spreadsheet_id: str, range_name: str) -> list[list[Any]]:
-    response = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
+    response = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=range_name)
+        .execute(num_retries=SHEETS_API_RETRIES)
+    )
     return response.get("values", [])
 
 
@@ -351,7 +357,11 @@ def clear_managed_rows(service, spreadsheet_id: str, sheet_name: str, headers: l
 
 
 def clear_values(service, spreadsheet_id: str, range_name: str) -> None:
-    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=range_name, body={}).execute()
+    service.spreadsheets().values().clear(
+        spreadsheetId=spreadsheet_id,
+        range=range_name,
+        body={},
+    ).execute(num_retries=SHEETS_API_RETRIES)
 
 
 def delete_legacy_sheets(service, spreadsheet_id: str, legacy_titles: list[str]) -> None:
@@ -2289,7 +2299,16 @@ def sync() -> None:
             f"comments_completed={len(comments)}/{discovered_comment_count}; unfinished items remain eligible next run",
         )
 
-    log_progress("sheets", f"Writing completed items: new_posts={len(posts)}, new_comments={len(comments)}")
+    # The Sheets HTTP connection can be idle for several minutes during Meta
+    # collection and Gemini analysis. Rebuild it before writes so a server-side
+    # idle disconnect cannot discard the completed analysis.
+    log_progress("sheets", "Refreshing Google Sheets connection before writes")
+    service = get_sheets_service()
+    log_progress(
+        "sheets",
+        f"Writing completed items: new_posts={len(posts)}, new_comments={len(comments)}; "
+        f"safe_api_retries={SHEETS_API_RETRIES}",
+    )
     write_results = [
         (
             POSTS_SHEET_NAME,
