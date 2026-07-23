@@ -161,6 +161,7 @@ COMMENT_INTENTS = [
     "question",
     "mockery",
     "information_request",
+    "answer",
     "service_request",
     "personal_story",
     "tag_friend",
@@ -1063,6 +1064,24 @@ def comment_text(comment: dict[str, Any], platform: str) -> str:
     return str(comment.get("message" if platform == "facebook" else "text") or "")
 
 
+def raw_commenter_name(comment: dict[str, Any], platform: str) -> str:
+    if platform == "facebook":
+        return str(comment.get("from", {}).get("name") or "")
+    return str(comment.get("username") or "")
+
+
+def is_greenpeace_raw_comment(comment: dict[str, Any], platform: str) -> bool:
+    if platform == "facebook":
+        commenter_id = str(comment.get("from", {}).get("id") or "")
+        return bool(
+            CONFIG["greenpeace_facebook_page_id"]
+            and commenter_id == str(CONFIG["greenpeace_facebook_page_id"])
+        )
+    username = str(comment.get("username") or "").lower()
+    official = CONFIG["greenpeace_instagram_username"].lower()
+    return bool(official and username == official)
+
+
 def add_comment(
     comments: list[dict[str, Any]],
     seen: set[str],
@@ -1072,6 +1091,8 @@ def add_comment(
     parent_comment_id: str,
     parent_comment_message: str,
     post_url: str,
+    parent_commenter_name: str = "",
+    parent_is_brand_comment: bool = False,
 ) -> dict[str, Any] | None:
     comment_id = str(raw_comment.get("id") or "")
     if not comment_id or comment_id in seen:
@@ -1114,6 +1135,10 @@ def add_comment(
         "comment_intent": "other",
         "is_sarcastic": False,
         "response_value_score": 0.0,
+        # Ephemeral routing context. These keys are intentionally not part of
+        # COMMENT_HEADERS and are therefore never written to Google Sheets.
+        "_parent_commenter_name": clean_text(parent_commenter_name),
+        "_parent_is_brand_comment": bool(parent_is_brand_comment),
     }
     row["is_brand_comment"] = is_greenpeace_comment(row, platform)
     comments.append(row)
@@ -1176,16 +1201,22 @@ def collect_visible_comments(
         if is_within(comment.get(date_field, ""), since_date, until_date):
             keep_added_comment(add_comment(comments, seen, platform, post_id, comment, "", "", post_url))
 
-        previous_message = comment_text(comment, platform)
         replies = sorted(
             comment.get(replies_field, {}).get("data") or [],
             key=lambda item: meta_date_sort_key(item, date_field),
         )
+        thread_comments_by_id = {
+            str(item.get("id") or ""): item
+            for item in [comment, *replies]
+            if item.get("id")
+        }
         for reply in replies:
             if not collection_time_available():
                 break
             if not is_within(reply.get(date_field, ""), since_date, until_date):
                 continue
+            structural_parent_id = str(reply.get("parent", {}).get("id") or comment.get("id") or "")
+            structural_parent = thread_comments_by_id.get(structural_parent_id, comment)
             keep_added_comment(
                 add_comment(
                     comments,
@@ -1193,12 +1224,13 @@ def collect_visible_comments(
                     platform,
                     post_id,
                     reply,
-                    comment.get("id", ""),
-                    previous_message,
+                    structural_parent_id,
+                    comment_text(structural_parent, platform),
                     post_url,
+                    raw_commenter_name(structural_parent, platform),
+                    is_greenpeace_raw_comment(structural_parent, platform),
                 )
             )
-            previous_message = comment_text(reply, platform)
 
 
 def select_oldest_comments(comments: list[dict[str, Any]], max_comments: int) -> list[dict[str, Any]]:
@@ -1814,6 +1846,43 @@ def analyze_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return analyzed_posts
 
 
+def explicitly_mentions_greenpeace(comment: dict[str, Any]) -> bool:
+    message = str(comment.get("comment_message") or "").casefold()
+    official_instagram = CONFIG["greenpeace_instagram_username"].casefold().lstrip("@")
+    if "גרינפיס" in message or "greenpeace" in message:
+        return True
+    return bool(official_instagram and re.search(rf"(?<![\w])@?{re.escape(official_instagram)}(?![\w])", message))
+
+
+def enforce_response_routing(comment: dict[str, Any], analysis: dict[str, Any]) -> bool:
+    """Apply deterministic organization-response rules without adding sheet columns."""
+    intent = str(comment.get("comment_intent") or "")
+    if intent in {"tag_friend", "spam"}:
+        comment["response_value_score"] = 0.0
+        return True
+
+    if not comment.get("parent_comment_id"):
+        return False
+
+    if comment.get("_parent_is_brand_comment"):
+        return False
+
+    reply_target = str(analysis.get("reply_target") or "unclear")
+    criticism_target = str(analysis.get("criticism_target") or "unclear")
+    is_org_directed = (
+        explicitly_mentions_greenpeace(comment)
+        or reply_target == "greenpeace"
+        or criticism_target in {"greenpeace", "post_claim"}
+    )
+    if is_org_directed:
+        return False
+
+    # Replies inside audience threads default to no organizational response.
+    # This gate protects the final score even when Gemini overvalues the reply.
+    comment["response_value_score"] = 0.0
+    return True
+
+
 def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not comments:
         return []
@@ -1848,6 +1917,14 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_intent": {"type": "STRING", "enum": COMMENT_INTENTS},
                         "is_sarcastic": {"type": "BOOLEAN"},
                         "response_value_score": {"type": "NUMBER"},
+                        "reply_target": {
+                            "type": "STRING",
+                            "enum": ["greenpeace", "another_user", "general_discussion", "unclear"],
+                        },
+                        "criticism_target": {
+                            "type": "STRING",
+                            "enum": ["greenpeace", "post_claim", "another_user", "external_actor", "general", "unclear"],
+                        },
                     },
                     "required": [
                         "comment_id",
@@ -1858,6 +1935,8 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                         "comment_intent",
                         "is_sarcastic",
                         "response_value_score",
+                        "reply_target",
+                        "criticism_target",
                     ],
                 },
             }
@@ -1881,24 +1960,34 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
                 "comment_id": comment["comment_id"],
                 "post_id": comment["post_id"],
                 "post_context": post_context.get(comment["post_id"], ""),
+                "commenter_name": comment.get("commenter_name", ""),
+                "parent_comment_id": comment.get("parent_comment_id", ""),
                 "parent_comment_message": truncate_text(comment.get("parent_comment_message", "")),
+                "parent_commenter_name": comment.get("_parent_commenter_name", ""),
+                "parent_is_brand_comment": bool(comment.get("_parent_is_brand_comment")),
                 "comment_message": truncate_text(comment["comment_message"]),
                 "is_brand_comment": bool(comment.get("is_brand_comment")),
+                "like_count": comment.get("like_count", 0),
+                "reply_count": comment.get("reply_count", 0),
             }
             for comment in batch
         ]
         prompt = (
             "Analyze Hebrew/English social media comments for Greenpeace Israel. "
             "Classify audience reaction to Greenpeace content, not the emotion of the post itself. "
-            "For replies, parent_comment_message contains the immediately previous message in the reply thread. "
-            "Use it as conversational context so sarcasm, agreement, disagreement, or answer intent can be interpreted correctly; "
-            "classify only comment_message, not the previous message. "
+            "For replies, parent_comment_message and parent_commenter_name describe the structural parent comment, "
+            "not merely the previous chronological reply. Use them only as conversational context and classify comment_message. "
+            "Determine reply_target: greenpeace only when the reply addresses Greenpeace/the organization; another_user when it "
+            "addresses or answers a participant; general_discussion when it is not directed to a specific participant; otherwise unclear. "
+            "Determine criticism_target separately. Criticism of another user, politician, company, or outside actor is not criticism "
+            "of Greenpeace. post_claim means the comment challenges a claim made by Greenpeace in the post. "
             "Return only valid JSON in this exact shape: "
             '{"comments":[{"comment_id":"...","comment_emotions":["Neutral"],"emotion_confidence":0.0,'
             '"comment_sentiment":"positive|negative|mixed|neutral|unclear",'
             '"comment_stance":"supportive|opposed|skeptical|neutral|unclear",'
-            '"comment_intent":"support|criticism|question|mockery|information_request|service_request|personal_story|tag_friend|political_attack|spam|other",'
-            '"is_sarcastic":false,"response_value_score":0.0}]}. '
+            '"comment_intent":"support|criticism|question|mockery|information_request|answer|service_request|personal_story|tag_friend|political_attack|spam|other",'
+            '"is_sarcastic":false,"response_value_score":0.0,"reply_target":"greenpeace|another_user|general_discussion|unclear",'
+            '"criticism_target":"greenpeace|post_claim|another_user|external_actor|general|unclear"}]}. '
             "Use the closed lists exactly. "
             "Do not classify a comment as Neutral when it contains insults, accusations, mockery, sarcasm, "
             "conspiracy claims, hostile language, disgust, anxiety, sadness, or clear support. "
@@ -1912,13 +2001,18 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             "and Neutral only for emotionally flat logistics, tags, simple facts, or unclear minimal text. "
             "Crying or sad emoji-only comments should use Sadness or Concern, not Neutral. "
             "Use service_request for donation, account, unsubscribe, billing, or operational support requests. "
+            "Use answer when a user answers another user's question, supplies requested information, or corrects another user; "
+            "do not label such replies information_request or service_request. "
             "Set response_value_score from 0.0 to 1.0 to estimate how much Greenpeace would benefit by replying publicly. "
             "Use 0.90-1.00 for comments where a reply can prevent reputational harm, correct serious misinformation, "
             "answer a high-value public question, de-escalate a visible conflict, or convert strong engagement into action. "
             "Use 0.70-0.89 for good-faith criticism, substantive skepticism, useful questions, or comments where a clear answer "
             "could educate other readers. Use 0.40-0.69 for moderate engagement or ambiguous criticism where a reply may help but is not essential. "
             "Use 0.10-0.39 for low-value agreement, brief reactions, repetitive criticism, or comments unlikely to change audience perception. "
-            "Use 0.00 for spam, tags, brand comments, or comments where replying has no clear organizational benefit. "
+            "Use 0.00 for spam, tags, answers between users, brand comments, or comments where replying has no clear organizational benefit. "
+            "A reply within an audience discussion must receive 0.00 unless it directly addresses Greenpeace, replies to an official "
+            "Greenpeace comment, or substantively challenges Greenpeace/the post's claim. Do not reward Greenpeace for intervening "
+            "in questions, corrections, criticism, insults, or debates directed at another user. "
             "Calibrate emotion_confidence: use 0.95 only when the emotion/stance is explicit and unambiguous, "
             "such as clear insults, strong praise, direct support, or direct hostility; use 0.85-0.90 when the classification is strong "
             "but depends on context or interpretation; use 0.65-0.80 for questions, short comments, sarcasm, mixed signals, "
@@ -1932,6 +2026,9 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             '- "איפה חותמים?" => emotions ["Agreement"], sentiment positive, stance supportive, intent information_request, response_value_score 0.70-0.89.\n'
             '- "🔥🔥🥵😣" on a climate disaster post => emotions ["Concern","Anxiety"], sentiment mixed, stance supportive.\n'
             '- "@friend" or only tagging a friend => emotions ["Neutral"], sentiment neutral, intent tag_friend.\n\n'
+            '- "יעל, תוכיחי שיש ריסוסים?" as a reply to Yael => intent question, reply_target another_user, response_value_score 0.00.\n'
+            '- "דרך חברת האשראי או הבנק" answering another user => intent answer, reply_target another_user, response_value_score 0.00.\n'
+            '- "Greenpeace Israel, תביאו הוכחות" => reply_target greenpeace, criticism_target greenpeace, eligible for a high score.\n\n'
             f"Comments:\n{json.dumps(items, ensure_ascii=False)}"
         )
         log_progress(
@@ -1945,6 +2042,7 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             log_progress("deadline", f"Comment analysis deadline reached before batch {batch_number}/{total_batches}")
             break
         analysis = {item["comment_id"]: item for item in generated.get("comments", [])}
+        routing_zeroed = 0
         for comment in batch:
             item = analysis.get(comment["comment_id"], {})
             comment["comment_emotions"] = allowed_list(item.get("comment_emotions"), COMMENT_EMOTIONS, ["Neutral"])
@@ -1954,6 +2052,12 @@ def analyze_comments(comments: list[dict[str, Any]], posts: list[dict[str, Any]]
             comment["comment_intent"] = allowed_value(item.get("comment_intent"), COMMENT_INTENTS, "other")
             comment["is_sarcastic"] = bool(item.get("is_sarcastic", False))
             comment["response_value_score"] = bounded_float(item.get("response_value_score"), 0.0, 1.0)
+            if enforce_response_routing(comment, item):
+                routing_zeroed += 1
+        log_progress(
+            "analysis",
+            f"Comment batch {batch_number}/{total_batches}: response scores forced to zero by routing rules={routing_zeroed}",
+        )
         completed_comments.extend(batch)
 
     zero_response_scores_for_answered_comments(completed_comments)
