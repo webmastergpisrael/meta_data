@@ -208,6 +208,7 @@ CONFIG = {
     "timezone": env_value("TIMEZONE", "UTC"),
     "max_comments_per_run": env_int("MAX_COMMENTS_PER_RUN", 500),
     "max_content_items_per_run": env_int("MAX_CONTENT_ITEMS_PER_RUN", 100),
+    "comments_per_existing_post_coverage": env_int("COMMENTS_PER_EXISTING_POST_COVERAGE", 5),
     "max_runtime_seconds": env_int("MAX_RUNTIME_SECONDS", DEFAULT_MAX_RUNTIME_SECONDS),
     "run_started_monotonic": 0.0,
     "run_deadline_monotonic": 0.0,
@@ -562,6 +563,33 @@ def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[st
     return output
 
 
+def existing_comment_state(
+    service,
+    spreadsheet_id: str,
+) -> tuple[set[str], dict[str, int]]:
+    """Load existing comment IDs and audience counts per post in one Sheets read."""
+    rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POST_COMMENTS_SHEET_NAME, f"A2:{col_letter(len(COMMENT_HEADERS))}"),
+    )
+    comment_id_index = COMMENT_HEADERS.index("comment_id")
+    post_id_index = COMMENT_HEADERS.index("post_id")
+    brand_index = COMMENT_HEADERS.index("is_brand_comment")
+    comment_ids: set[str] = set()
+    audience_counts: dict[str, int] = defaultdict(int)
+    for raw_row in rows:
+        row = pad_row(raw_row, len(COMMENT_HEADERS))
+        comment_id = str(row[comment_id_index] or "").strip()
+        post_id = str(row[post_id_index] or "").strip()
+        is_brand = str(row[brand_index] or "").strip().lower() == "true"
+        if comment_id:
+            comment_ids.add(comment_id)
+        if post_id and comment_id and not is_brand:
+            audience_counts[post_id] += 1
+    return comment_ids, dict(audience_counts)
+
+
 def upsert_by_key(
     service,
     spreadsheet_id: str,
@@ -903,7 +931,7 @@ def fetch_facebook_posts(page_id: str, post_since: datetime, until: datetime, co
             "limit": 100,
         },
         access_token,
-        CONFIG["max_content_items_per_run"],
+        0,
     )
 
 
@@ -925,7 +953,7 @@ def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: dat
         f"/{ig_user_id}/media",
         {"fields": fields, "since": to_unix(since_date), "until": to_unix(until_date), "limit": 100},
         access_token,
-        CONFIG["max_content_items_per_run"],
+        0,
     )
     return [item for item in media if is_within(item.get("timestamp", ""), since_date, until_date)]
 
@@ -1009,7 +1037,7 @@ def fetch_ads(ad_account_id: str, since_date: datetime, until_date: datetime, ac
             "limit": 100,
         },
         access_token,
-        CONFIG["max_content_items_per_run"],
+        0,
     )
     return [ad for ad in ads if is_within(ad.get("created_time", ""), since_date, until_date)]
 
@@ -1255,12 +1283,101 @@ def select_oldest_comments(comments: list[dict[str, Any]], max_comments: int) ->
     return comments[:max_comments]
 
 
+def select_comments_with_existing_post_coverage(
+    comments: list[dict[str, Any]],
+    max_comments: int,
+    existing_post_ids: set[str],
+    existing_audience_counts: dict[str, int],
+    per_post_coverage: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Cover existing posts first, then fill the remaining quota chronologically."""
+    if max_comments < 1:
+        raise RuntimeError("MAX_COMMENTS_PER_RUN must be at least 1")
+    if per_post_coverage < 1:
+        raise RuntimeError("COMMENTS_PER_EXISTING_POST_COVERAGE must be at least 1")
+
+    chronological = sorted(
+        comments,
+        key=lambda comment: (
+            meta_date_sort_key(comment, "comment_created_time"),
+            str(comment.get("comment_id") or ""),
+        ),
+    )
+    audience_by_existing_post: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for comment in chronological:
+        post_id = str(comment.get("post_id") or "")
+        if post_id in existing_post_ids and not comment.get("is_brand_comment"):
+            audience_by_existing_post[post_id].append(comment)
+
+    prioritized_post_ids = sorted(
+        audience_by_existing_post,
+        key=lambda post_id: (
+            existing_audience_counts.get(post_id, 0),
+            meta_date_sort_key(audience_by_existing_post[post_id][0], "comment_created_time"),
+            post_id,
+        ),
+    )
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+
+    # Round-robin prevents one busy post from consuming the coverage reserve.
+    for coverage_round in range(per_post_coverage):
+        for post_id in prioritized_post_ids:
+            post_comments = audience_by_existing_post[post_id]
+            if coverage_round >= len(post_comments) or len(selected) >= max_comments:
+                continue
+            comment = post_comments[coverage_round]
+            selected.append(comment)
+            selected_ids.add(str(comment.get("comment_id") or ""))
+        if len(selected) >= max_comments:
+            break
+
+    coverage_count = len(selected)
+    for comment in chronological:
+        if len(selected) >= max_comments:
+            break
+        comment_id = str(comment.get("comment_id") or "")
+        if comment_id in selected_ids:
+            continue
+        selected.append(comment)
+        selected_ids.add(comment_id)
+
+    selected.sort(
+        key=lambda comment: (
+            meta_date_sort_key(comment, "comment_created_time"),
+            str(comment.get("comment_id") or ""),
+        )
+    )
+    return selected, coverage_count
+
+
+def content_target_ids(source: str, item: dict[str, Any]) -> set[str]:
+    if source != "ad":
+        item_id = str(item.get("id") or "")
+        return {item_id} if item_id else set()
+    creative = item.get("creative", {})
+    targets = {
+        str(target_id)
+        for target_id in (
+            creative.get("effective_object_story_id"),
+            creative.get("effective_instagram_media_id"),
+        )
+        if target_id
+    }
+    if targets:
+        return targets
+    item_id = str(item.get("id") or "")
+    return {item_id} if item_id else set()
+
+
 def collect_rows(
     existing_post_ids: set[str] | None = None,
     existing_comment_ids: set[str] | None = None,
+    existing_audience_counts: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     existing_post_ids = existing_post_ids or set()
     existing_comment_ids = existing_comment_ids or set()
+    existing_audience_counts = existing_audience_counts or {}
     access_token = meta_access_token()
     window_start, window_end = collection_window()
     log_progress(
@@ -1283,6 +1400,7 @@ def collect_rows(
     seen_comments: set[str] = set(existing_comment_ids)
     max_comments = CONFIG["max_comments_per_run"]
     max_content_items = CONFIG["max_content_items_per_run"]
+    per_post_coverage = CONFIG["comments_per_existing_post_coverage"]
     if max_content_items < 1:
         raise RuntimeError("MAX_CONTENT_ITEMS_PER_RUN must be at least 1")
     processed_content_items = 0
@@ -1311,29 +1429,76 @@ def collect_rows(
         if collection_time_available()
         else []
     )
-    content_candidates = [
-        (meta_date_sort_key(post, "created_time"), "facebook", str(post.get("id") or ""))
+    content_candidates: list[tuple[str, dict[str, Any], str]] = []
+    content_candidates.extend(
+        ("facebook", post, "created_time")
         for post in facebook_posts
         if post.get("id")
-    ]
+    )
     content_candidates.extend(
-        (meta_date_sort_key(media, "timestamp"), "instagram", str(media.get("id") or ""))
+        ("instagram", media, "timestamp")
         for media in instagram_media
         if media.get("id")
     )
     content_candidates.extend(
-        (meta_date_sort_key(ad, "created_time"), "ad", str(ad.get("id") or ""))
+        ("ad", ad, "created_time")
         for ad in ads
         if ad.get("id")
     )
-    content_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-    selected_content = content_candidates[:max_content_items]
-    selected_facebook_ids = {item_id for _, source, item_id in selected_content if source == "facebook"}
-    selected_instagram_ids = {item_id for _, source, item_id in selected_content if source == "instagram"}
-    selected_ad_ids = {item_id for _, source, item_id in selected_content if source == "ad"}
+
+    def content_priority(candidate: tuple[str, dict[str, Any], str]) -> tuple[Any, ...]:
+        source, item, date_field = candidate
+        targets = content_target_ids(source, item)
+        existing_targets = targets & existing_post_ids
+        is_existing = bool(existing_targets)
+        stored_audience_count = (
+            min(existing_audience_counts.get(post_id, 0) for post_id in existing_targets)
+            if existing_targets
+            else 0
+        )
+        return (
+            0 if is_existing else 1,
+            stored_audience_count,
+            meta_date_sort_key(item, date_field),
+            source,
+            str(item.get("id") or ""),
+        )
+
+    content_candidates.sort(key=content_priority)
+    selected_content: list[tuple[str, dict[str, Any], str]] = []
+    selected_target_ids: set[str] = set()
+    for candidate in content_candidates:
+        targets = content_target_ids(candidate[0], candidate[1])
+        if targets and targets.issubset(selected_target_ids):
+            continue
+        selected_content.append(candidate)
+        selected_target_ids.update(targets)
+        if len(selected_content) >= max_content_items:
+            break
+    selected_facebook_ids = {
+        str(item.get("id") or "")
+        for source, item, _ in selected_content
+        if source == "facebook"
+    }
+    selected_instagram_ids = {
+        str(item.get("id") or "")
+        for source, item, _ in selected_content
+        if source == "instagram"
+    }
+    selected_ad_ids = {
+        str(item.get("id") or "")
+        for source, item, _ in selected_content
+        if source == "ad"
+    }
+    selected_existing_count = sum(
+        1
+        for source, item, _ in selected_content
+        if content_target_ids(source, item) & existing_post_ids
+    )
     log_progress(
         "collect",
-        f"Content candidates={len(content_candidates)}, selected={len(selected_content)} "
+        f"Content candidates={len(content_candidates)}, selected={len(selected_content)}, "
+        f"existing_first={selected_existing_count}, new_after_existing={len(selected_content) - selected_existing_count} "
         f"(facebook={len(selected_facebook_ids)}, instagram={len(selected_instagram_ids)}, ads={len(selected_ad_ids)})",
     )
 
@@ -1516,11 +1681,18 @@ def collect_rows(
             f"new_comments={len(comments) - comments_before}",
         )
     candidate_count = len(comments)
-    selected_comments = select_oldest_comments(comments, max_comments)
+    selected_comments, coverage_count = select_comments_with_existing_post_coverage(
+        comments,
+        max_comments,
+        existing_post_ids,
+        existing_audience_counts,
+        per_post_coverage,
+    )
     deferred_count = candidate_count - len(selected_comments)
     print(
         "New comment candidates: "
         f"found={candidate_count}, selected={len(selected_comments)}, deferred={deferred_count}, "
+        f"existing_post_coverage_selected={coverage_count}, coverage_per_post={per_post_coverage}, "
         f"limit={max_comments}."
     )
     if not collection_time_available():
@@ -2259,6 +2431,7 @@ def sync() -> None:
         f"Starting sync: lookback_days={CONFIG['lookback_days']}, "
         f"content_limit={CONFIG['max_content_items_per_run']}, "
         f"comment_limit={CONFIG['max_comments_per_run']}, "
+        f"existing_post_coverage={CONFIG['comments_per_existing_post_coverage']}, "
         f"runtime_limit={CONFIG['max_runtime_seconds']}s, "
         f"gemini_batch_size={CONFIG['analysis_batch_size']}",
     )
@@ -2269,19 +2442,18 @@ def sync() -> None:
     log_progress("sheets", f"Using spreadsheet {spreadsheet_id}")
 
     known_post_ids = existing_ids(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, "post_id")
-    known_comment_ids = existing_ids(
-        service,
-        spreadsheet_id,
-        POST_COMMENTS_SHEET_NAME,
-        COMMENT_HEADERS,
-        "comment_id",
-    )
+    known_comment_ids, existing_audience_counts = existing_comment_state(service, spreadsheet_id)
     log_progress(
         "sheets",
-        f"Loaded existing IDs: posts={len(known_post_ids)}, comments={len(known_comment_ids)}",
+        f"Loaded existing IDs: posts={len(known_post_ids)}, comments={len(known_comment_ids)}, "
+        f"posts_with_audience_comments={sum(1 for count in existing_audience_counts.values() if count > 0)}",
     )
 
-    posts, comments, scanned_posts = collect_rows(known_post_ids, known_comment_ids)
+    posts, comments, scanned_posts = collect_rows(
+        known_post_ids,
+        known_comment_ids,
+        existing_audience_counts,
+    )
     if env_bool("ANALYZE_WITH_GEMINI", True):
         discovered_post_count = len(posts)
         discovered_comment_count = len(comments)
