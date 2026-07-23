@@ -590,6 +590,32 @@ def existing_comment_state(
     return comment_ids, dict(audience_counts)
 
 
+def existing_post_state(
+    service,
+    spreadsheet_id: str,
+) -> tuple[set[str], dict[str, datetime]]:
+    """Load existing post IDs and their last completed comment-scan timestamps."""
+    rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"),
+    )
+    post_id_index = POST_HEADERS.index("post_id")
+    window_end_index = POST_HEADERS.index("collected_window_end")
+    post_ids: set[str] = set()
+    last_scanned: dict[str, datetime] = {}
+    for raw_row in rows:
+        row = pad_row(raw_row, len(POST_HEADERS))
+        post_id = str(row[post_id_index] or "").strip()
+        if not post_id:
+            continue
+        post_ids.add(post_id)
+        parsed = parse_meta_date(str(row[window_end_index] or ""))
+        if parsed:
+            last_scanned[post_id] = parsed
+    return post_ids, last_scanned
+
+
 def upsert_by_key(
     service,
     spreadsheet_id: str,
@@ -1333,14 +1359,24 @@ def select_comments_with_existing_post_coverage(
             break
 
     coverage_count = len(selected)
-    for comment in chronological:
+
+    # Strict phase ordering: exhaust unseen comments from existing sheet posts
+    # before any comment belonging to newly discovered content can use capacity.
+    for existing_phase in (True, False):
+        for comment in chronological:
+            if len(selected) >= max_comments:
+                break
+            post_id = str(comment.get("post_id") or "")
+            belongs_to_existing_post = post_id in existing_post_ids
+            if belongs_to_existing_post != existing_phase:
+                continue
+            comment_id = str(comment.get("comment_id") or "")
+            if comment_id in selected_ids:
+                continue
+            selected.append(comment)
+            selected_ids.add(comment_id)
         if len(selected) >= max_comments:
             break
-        comment_id = str(comment.get("comment_id") or "")
-        if comment_id in selected_ids:
-            continue
-        selected.append(comment)
-        selected_ids.add(comment_id)
 
     selected.sort(
         key=lambda comment: (
@@ -1374,10 +1410,12 @@ def collect_rows(
     existing_post_ids: set[str] | None = None,
     existing_comment_ids: set[str] | None = None,
     existing_audience_counts: dict[str, int] | None = None,
+    existing_post_last_scanned: dict[str, datetime] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     existing_post_ids = existing_post_ids or set()
     existing_comment_ids = existing_comment_ids or set()
     existing_audience_counts = existing_audience_counts or {}
+    existing_post_last_scanned = existing_post_last_scanned or {}
     access_token = meta_access_token()
     window_start, window_end = collection_window()
     log_progress(
@@ -1446,28 +1484,64 @@ def collect_rows(
         if ad.get("id")
     )
 
-    def content_priority(candidate: tuple[str, dict[str, Any], str]) -> tuple[Any, ...]:
+    never_scanned = datetime.min.replace(tzinfo=timezone.utc)
+
+    def candidate_existing_targets(candidate: tuple[str, dict[str, Any], str]) -> set[str]:
+        return content_target_ids(candidate[0], candidate[1]) & existing_post_ids
+
+    def candidate_last_scanned(candidate: tuple[str, dict[str, Any], str]) -> datetime:
+        targets = candidate_existing_targets(candidate)
+        return min(
+            (existing_post_last_scanned.get(post_id, never_scanned) for post_id in targets),
+            default=never_scanned,
+        )
+
+    def existing_content_priority(candidate: tuple[str, dict[str, Any], str]) -> tuple[Any, ...]:
         source, item, date_field = candidate
-        targets = content_target_ids(source, item)
-        existing_targets = targets & existing_post_ids
-        is_existing = bool(existing_targets)
+        existing_targets = candidate_existing_targets(candidate)
         stored_audience_count = (
             min(existing_audience_counts.get(post_id, 0) for post_id in existing_targets)
             if existing_targets
             else 0
         )
         return (
-            0 if is_existing else 1,
+            candidate_last_scanned(candidate),
             stored_audience_count,
             meta_date_sort_key(item, date_field),
             source,
             str(item.get("id") or ""),
         )
 
-    content_candidates.sort(key=content_priority)
+    existing_candidates = [
+        candidate for candidate in content_candidates if candidate_existing_targets(candidate)
+    ]
+    new_candidates = [
+        candidate for candidate in content_candidates if not candidate_existing_targets(candidate)
+    ]
+    oldest_existing_scan = min(
+        (candidate_last_scanned(candidate) for candidate in existing_candidates),
+        default=None,
+    )
+    pending_existing = [
+        candidate
+        for candidate in existing_candidates
+        if candidate_last_scanned(candidate) == oldest_existing_scan
+    ]
+    pending_existing.sort(key=existing_content_priority)
+    new_candidates.sort(
+        key=lambda candidate: (
+            meta_date_sort_key(candidate[1], candidate[2]),
+            candidate[0],
+            str(candidate[1].get("id") or ""),
+        )
+    )
+
+    # Strict queue: only the oldest not-yet-completed existing scan cohort is
+    # considered first. New content can use capacity only after that cohort fits.
+    content_queue = [*pending_existing, *new_candidates]
     selected_content: list[tuple[str, dict[str, Any], str]] = []
     selected_target_ids: set[str] = set()
-    for candidate in content_candidates:
+    for candidate in content_queue:
         targets = content_target_ids(candidate[0], candidate[1])
         if targets and targets.issubset(selected_target_ids):
             continue
@@ -1498,6 +1572,7 @@ def collect_rows(
     log_progress(
         "collect",
         f"Content candidates={len(content_candidates)}, selected={len(selected_content)}, "
+        f"existing_candidates={len(existing_candidates)}, pending_existing_cohort={len(pending_existing)}, "
         f"existing_first={selected_existing_count}, new_after_existing={len(selected_content) - selected_existing_count} "
         f"(facebook={len(selected_facebook_ids)}, instagram={len(selected_instagram_ids)}, ads={len(selected_ad_ids)})",
     )
@@ -1737,10 +1812,16 @@ def make_post_row(
         "collected_greenpeace_comment_count": sum(1 for comment in comments if comment.get("is_brand_comment")),
         "collected_like_count": like_count,
         "collected_reply_count": reply_count,
-        "collected_window_start": collected_window_start.date().isoformat(),
-        "collected_window_end": collected_window_end.date().isoformat(),
+        "collected_window_start": collected_window_start.isoformat(),
+        "collected_window_end": collected_window_end.isoformat(),
         "post_emotions": ["Neutral"],
         "post_sentiment": "neutral",
+        # Ephemeral checkpoint data; not part of POST_HEADERS.
+        "_new_comment_ids": {
+            str(comment.get("comment_id") or "")
+            for comment in comments
+            if comment.get("comment_id")
+        },
     }
 
 
@@ -2424,94 +2505,13 @@ def refresh_derived_metrics(service, spreadsheet_id: str) -> tuple[int, int]:
     return len(posts), summary_total
 
 
-def sync() -> None:
-    start_runtime_budget()
-    log_progress(
-        "start",
-        f"Starting sync: lookback_days={CONFIG['lookback_days']}, "
-        f"content_limit={CONFIG['max_content_items_per_run']}, "
-        f"comment_limit={CONFIG['max_comments_per_run']}, "
-        f"existing_post_coverage={CONFIG['comments_per_existing_post_coverage']}, "
-        f"runtime_limit={CONFIG['max_runtime_seconds']}s, "
-        f"gemini_batch_size={CONFIG['analysis_batch_size']}",
-    )
-    spreadsheet_id = required_env("SPREADSHEET_ID")
-    service = get_sheets_service()
-    log_progress("sheets", "Ensuring Google Sheets schema")
-    ensure_schema(service, spreadsheet_id)
-    log_progress("sheets", f"Using spreadsheet {spreadsheet_id}")
+def update_scanned_post_checkpoints(
+    service,
+    spreadsheet_id: str,
+    scanned_posts: list[dict[str, Any]],
+    completed_comments: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Advance existing-post queue checkpoints only after all discovered comments were written."""
+    if not scanned_posts:
+        return 0, 0
 
-    known_post_ids = existing_ids(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, "post_id")
-    known_comment_ids, existing_audience_counts = existing_comment_state(service, spreadsheet_id)
-    log_progress(
-        "sheets",
-        f"Loaded existing IDs: posts={len(known_post_ids)}, comments={len(known_comment_ids)}, "
-        f"posts_with_audience_comments={sum(1 for count in existing_audience_counts.values() if count > 0)}",
-    )
-
-    posts, comments, scanned_posts = collect_rows(
-        known_post_ids,
-        known_comment_ids,
-        existing_audience_counts,
-    )
-    if env_bool("ANALYZE_WITH_GEMINI", True):
-        discovered_post_count = len(posts)
-        discovered_comment_count = len(comments)
-        posts = analyze_posts(posts)
-        eligible_post_ids = known_post_ids | {str(post.get("post_id") or "") for post in posts}
-        eligible_comments = [
-            comment
-            for comment in comments
-            if str(comment.get("post_id") or "") in eligible_post_ids
-        ]
-        comments = analyze_comments(eligible_comments, scanned_posts)
-        log_progress(
-            "deadline",
-            f"Analysis result: posts_completed={len(posts)}/{discovered_post_count}, "
-            f"comments_completed={len(comments)}/{discovered_comment_count}; unfinished items remain eligible next run",
-        )
-
-    # The Sheets HTTP connection can be idle for several minutes during Meta
-    # collection and Gemini analysis. Rebuild it before writes so a server-side
-    # idle disconnect cannot discard the completed analysis.
-    log_progress("sheets", "Refreshing Google Sheets connection before writes")
-    service = get_sheets_service()
-    log_progress(
-        "sheets",
-        f"Writing completed items: new_posts={len(posts)}, new_comments={len(comments)}; "
-        f"safe_api_retries={SHEETS_API_RETRIES}",
-    )
-    write_results = [
-        (
-            POSTS_SHEET_NAME,
-            append_new_rows(service, spreadsheet_id, POSTS_SHEET_NAME, POST_HEADERS, ["post_id"], posts),
-        ),
-        (
-            POST_COMMENTS_SHEET_NAME,
-            append_new_rows(
-                service,
-                spreadsheet_id,
-                POST_COMMENTS_SHEET_NAME,
-                COMMENT_HEADERS,
-                ["comment_id"],
-                comments,
-            ),
-        ),
-    ]
-    for sheet_name, (updated, appended, total_rows) in write_results:
-        log_progress(
-            "sheets",
-            f"Sheet '{sheet_name}': updated={updated}, appended={appended}, total_rows={total_rows}",
-        )
-    zeroed_scores = reconcile_answered_response_scores(service, spreadsheet_id)
-    refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
-    log_progress(
-        "complete",
-        f"Synced {len(posts)} new posts and {len(comments)} new comments/replies. "
-        f"Zeroed {zeroed_scores} answered response scores and refreshed "
-        f"{refreshed_posts} post counters / {refreshed_summaries} summaries.",
-    )
-
-
-if __name__ == "__main__":
-    sync()
