@@ -34,6 +34,19 @@ Add these in `Settings -> Secrets and variables -> Actions -> Variables` if you 
 - `GEMINI_RETRY_BASE_SECONDS` - default: `20`.
 - `GEMINI_FALLBACK_ON_ERROR` - default: `false`; fails the run if Gemini analysis does not return valid data.
 - `GEMINI_FALLBACK_AFTER_QUOTA_ERROR` - default: `false`; avoids spending another request after Gemini returns quota/rate-limit errors.
+- `RETENTION_MONTHS` - default: `12`. Posts older than this are removed along with their comments and summary rows, so the spreadsheet stays workable. Set to `0` to keep everything forever.
+- `RETENTION_DRY_RUN` - default: `true`. While true the run only logs what it *would* delete. Set to `false` to actually prune.
+
+## Retention
+
+Whole posts are pruned, not just the oldest comment rows. `refresh_derived_metrics` recomputes each post's comment counters from whatever comments are still in the sheet, so deleting comments on their own would silently rewrite old posts' counters to zero and leave the Posts and Summary tabs disagreeing with the comments.
+
+Two safeguards are built in:
+
+- The cutoff is clamped so it can never reach into the scan window (`LOOKBACK_DAYS`). The sheet doubles as the de-duplication memory, so anything deleted while the scan still returns it would be treated as new, re-sent to Gemini and re-appended on every run.
+- A post whose `post_created_time` cannot be parsed is always kept, rather than having its age guessed.
+
+Deletion cannot be undone, so `RETENTION_DRY_RUN` starts as `true`. Check the reported counts in the run log for a few days before switching it off.
 
 ## Comment Analysis Columns
 

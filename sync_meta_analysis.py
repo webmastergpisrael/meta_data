@@ -222,6 +222,13 @@ CONFIG = {
     "max_comments_per_run": env_int("MAX_COMMENTS_PER_RUN", 500),
     "max_content_items_per_run": env_int("MAX_CONTENT_ITEMS_PER_RUN", 100),
     "full_scan_interval_days": env_int("FULL_SCAN_INTERVAL_DAYS", 30),
+    # Retention. Posts older than this, and their comments and summaries, are
+    # removed so the spreadsheet stays workable. 0 disables pruning entirely.
+    "retention_months": env_int("RETENTION_MONTHS", 12),
+    # Starts in report-only mode on purpose: deletion cannot be undone, so the
+    # first runs log exactly what would go and delete nothing. Set
+    # RETENTION_DRY_RUN=false once the reported numbers look right.
+    "retention_dry_run": env_bool("RETENTION_DRY_RUN", True),
     "delta_overlap_hours": env_int("DELTA_OVERLAP_HOURS", 24),
     "max_runtime_seconds": env_int("MAX_RUNTIME_SECONDS", DEFAULT_MAX_RUNTIME_SECONDS),
     "run_started_monotonic": 0.0,
@@ -2700,6 +2707,154 @@ def reconcile_brand_thread_response_scores(service, spreadsheet_id: str) -> int:
     return changed
 
 
+def retention_cutoff(now: datetime, retention_months: int, lookback_days: int) -> datetime:
+    """Oldest date worth keeping.
+
+    Clamped so it can never reach into the scan window. The sheet is also the
+    de-duplication memory: the run skips anything whose id it already finds
+    there. Delete something the scan still returns and it is treated as new,
+    re-sent to Gemini and re-appended on every run -- a loop that costs money.
+    """
+    months = max(0, retention_months)
+    cutoff = now - timedelta(days=months * 30)
+    floor = now - timedelta(days=max(1, lookback_days) * 2)
+    return min(cutoff, floor)
+
+
+def delete_sheet_rows(service, spreadsheet_id: str, sheet_id: int, row_indexes: list[int]) -> int:
+    """Delete 1-based sheet rows.
+
+    Deleting shifts everything below it up, so contiguous runs are collapsed
+    into single requests and issued bottom-up to keep the remaining indexes
+    valid.
+    """
+    if not row_indexes:
+        return 0
+
+    ordered = sorted(set(row_indexes))
+    blocks: list[tuple[int, int]] = []
+    for row in ordered:
+        if blocks and row == blocks[-1][1] + 1:
+            blocks[-1] = (blocks[-1][0], row)
+        else:
+            blocks.append((row, row))
+
+    requests = [
+        {
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": start - 1,  # API is 0-based, half-open
+                    "endIndex": end,
+                }
+            }
+        }
+        for start, end in reversed(blocks)
+    ]
+    batch_update(service, spreadsheet_id, requests)
+    return len(ordered)
+
+
+def prune_expired_content(service, spreadsheet_id: str) -> dict[str, int]:
+    """Drop posts past the retention window, with their comments and summaries.
+
+    Whole posts are removed rather than merely the oldest N comment rows,
+    because refresh_derived_metrics() recomputes each post's comment counters
+    from whatever comments remain in the sheet. Deleting comments alone would
+    silently rewrite old posts' counters to zero and leave the Posts and
+    Summary tabs disagreeing with reality.
+    """
+    stats = {"posts": 0, "comments": 0, "summaries": 0}
+    retention_months = int(CONFIG.get("retention_months") or 0)
+
+    if retention_months <= 0:
+        return stats
+
+    cutoff = retention_cutoff(
+        datetime.now(timezone.utc),
+        retention_months,
+        int(CONFIG.get("lookback_days") or 30),
+    )
+    metadata = get_spreadsheet(service, spreadsheet_id)
+
+    post_rows = get_values(
+        service,
+        spreadsheet_id,
+        sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"),
+    )
+    created_index = POST_HEADERS.index("post_created_time")
+    post_id_index = POST_HEADERS.index("post_id")
+
+    expired_post_ids: set[str] = set()
+    expired_post_rows: list[int] = []
+    for offset, raw_row in enumerate(post_rows):
+        row = pad_row(raw_row, len(POST_HEADERS))
+        created = parse_meta_date(str(row[created_index] or ""))
+        # An unparseable date is kept: better a slightly larger sheet than
+        # deleting something whose age cannot be established.
+        if not created or created >= cutoff:
+            continue
+        post_id = str(row[post_id_index] or "").strip()
+        if not post_id:
+            continue
+        expired_post_ids.add(post_id)
+        expired_post_rows.append(offset + 2)
+
+    if not expired_post_ids:
+        return stats
+
+    def expired_rows_in(sheet_name: str, headers: list[str]) -> list[int]:
+        rows = get_values(
+            service,
+            spreadsheet_id,
+            sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"),
+        )
+        index = headers.index("post_id")
+        return [
+            offset + 2
+            for offset, raw_row in enumerate(rows)
+            if str(pad_row(raw_row, len(headers))[index] or "").strip() in expired_post_ids
+        ]
+
+    comment_rows = expired_rows_in(POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS)
+    summary_rows = expired_rows_in(POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS)
+
+    stats = {
+        "posts": len(expired_post_rows),
+        "comments": len(comment_rows),
+        "summaries": len(summary_rows),
+    }
+
+    if CONFIG.get("retention_dry_run", True):
+        log_progress(
+            "retention",
+            f"DRY RUN, nothing deleted: {stats['posts']} posts, {stats['comments']} comments, "
+            f"{stats['summaries']} summaries are older than {cutoff.date()} "
+            f"(RETENTION_MONTHS={retention_months}). Set RETENTION_DRY_RUN=false to apply.",
+        )
+        return stats
+
+    # Comments and summaries first: if the run dies midway, orphaned children
+    # are harmless, whereas posts without their comments would have their
+    # counters rewritten to zero by refresh_derived_metrics().
+    for sheet_name, headers, rows in (
+        (POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, comment_rows),
+        (POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, summary_rows),
+        (POSTS_SHEET_NAME, POST_HEADERS, expired_post_rows),
+    ):
+        sheet = find_sheet(metadata, sheet_name)
+        if sheet and rows:
+            delete_sheet_rows(service, spreadsheet_id, sheet["sheetId"], rows)
+
+    log_progress(
+        "retention",
+        f"Pruned content older than {cutoff.date()}: {stats['posts']} posts, "
+        f"{stats['comments']} comments, {stats['summaries']} summaries",
+    )
+    return stats
+
+
 def refresh_derived_metrics(service, spreadsheet_id: str) -> tuple[int, int]:
     raw_comment_rows = get_values(
         service,
@@ -2931,6 +3086,9 @@ def sync() -> None:
         f"held_for_deferred_or_unanalyzed_comments={incomplete_post_scans}",
     )
     zeroed_scores = reconcile_brand_thread_response_scores(service, spreadsheet_id)
+    # Prune before the refresh so the counters below are recomputed from what
+    # actually remains, rather than being rewritten again on the next run.
+    prune_expired_content(service, spreadsheet_id)
     refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
     log_progress(
         "complete",

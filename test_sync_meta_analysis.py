@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import sync_meta_analysis as sync
@@ -841,6 +841,213 @@ class GridCapacityTests(unittest.TestCase):
         sync.update_values(service, "sheet-id", "'Post/Ad Comments'!A1541:T1655", [["x"]])
 
         self.assertEqual(service.updates, ["'Post/Ad Comments'!A1541:T1655"])
+
+
+class RetentionCutoffTests(unittest.TestCase):
+    def test_cutoff_is_roughly_the_configured_number_of_months_back(self):
+        now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+
+        cutoff = sync.retention_cutoff(now, retention_months=12, lookback_days=30)
+
+        self.assertLess(cutoff, now - timedelta(days=300))
+        self.assertGreater(cutoff, now - timedelta(days=400))
+
+    def test_cutoff_never_reaches_into_the_scan_window(self):
+        """A short retention must not delete items the scan still returns --
+        those would be re-analysed by Gemini and re-appended every run."""
+        now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+
+        cutoff = sync.retention_cutoff(now, retention_months=1, lookback_days=30)
+
+        self.assertLessEqual(cutoff, now - timedelta(days=60))
+
+    def test_zero_months_is_still_clamped_rather_than_deleting_everything(self):
+        now = datetime(2026, 8, 5, tzinfo=timezone.utc)
+
+        cutoff = sync.retention_cutoff(now, retention_months=0, lookback_days=30)
+
+        self.assertLessEqual(cutoff, now - timedelta(days=60))
+
+
+class DeleteSheetRowsTests(unittest.TestCase):
+    class Recorder:
+        def __init__(self):
+            self.requests = []
+
+    def _capture(self):
+        recorder = self.Recorder()
+
+        def fake_batch_update(service, spreadsheet_id, requests):
+            recorder.requests.extend(requests)
+
+        return recorder, fake_batch_update
+
+    def test_contiguous_rows_collapse_into_one_request(self):
+        recorder, fake = self._capture()
+        with patch.object(sync, "batch_update", fake):
+            deleted = sync.delete_sheet_rows(None, "sheet-id", 7, [5, 6, 7])
+
+        self.assertEqual(deleted, 3)
+        self.assertEqual(len(recorder.requests), 1)
+        rng = recorder.requests[0]["deleteDimension"]["range"]
+        self.assertEqual((rng["startIndex"], rng["endIndex"]), (4, 7))
+
+    def test_rows_are_deleted_bottom_up_so_indexes_stay_valid(self):
+        recorder, fake = self._capture()
+        with patch.object(sync, "batch_update", fake):
+            sync.delete_sheet_rows(None, "sheet-id", 7, [2, 10, 20])
+
+        starts = [r["deleteDimension"]["range"]["startIndex"] for r in recorder.requests]
+        self.assertEqual(starts, sorted(starts, reverse=True))
+
+    def test_nothing_to_delete_issues_no_request(self):
+        recorder, fake = self._capture()
+        with patch.object(sync, "batch_update", fake):
+            deleted = sync.delete_sheet_rows(None, "sheet-id", 7, [])
+
+        self.assertEqual(deleted, 0)
+        self.assertEqual(recorder.requests, [])
+
+
+class FakeRetentionSheets:
+    """Stands in for the three tabs so the whole prune flow can be exercised."""
+
+    def __init__(self, posts, comments, summaries):
+        self.data = {
+            sync.POSTS_SHEET_NAME: posts,
+            sync.POST_COMMENTS_SHEET_NAME: comments,
+            sync.POST_SUMMARY_SHEET_NAME: summaries,
+        }
+        self.sheet_ids = {
+            sync.POSTS_SHEET_NAME: 1,
+            sync.POST_COMMENTS_SHEET_NAME: 2,
+            sync.POST_SUMMARY_SHEET_NAME: 3,
+        }
+        self.deleted = []
+
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self
+
+    def execute(self, num_retries=0):
+        return self._result
+
+    def get(self, spreadsheetId=None, fields=None, range=None, **kwargs):
+        if range is None:
+            self._result = {
+                "sheets": [
+                    {"properties": {"sheetId": sid, "title": title,
+                                    "gridProperties": {"rowCount": 5000, "columnCount": 26}}}
+                    for title, sid in self.sheet_ids.items()
+                ]
+            }
+        else:
+            title = range.split("!")[0].strip("'")
+            self._result = {"values": self.data.get(title, [])}
+        return self
+
+    def batchUpdate(self, spreadsheetId=None, body=None, **kwargs):
+        for request in body.get("requests", []):
+            rng = request.get("deleteDimension", {}).get("range")
+            if rng:
+                self.deleted.append((rng["sheetId"], rng["startIndex"], rng["endIndex"]))
+        self._result = {}
+        return self
+
+
+def _post_row(post_id, created):
+    row = [""] * len(sync.POST_HEADERS)
+    row[sync.POST_HEADERS.index("post_id")] = post_id
+    row[sync.POST_HEADERS.index("post_created_time")] = created
+    return row
+
+
+def _child_row(headers, post_id):
+    row = [""] * len(headers)
+    row[headers.index("post_id")] = post_id
+    return row
+
+
+class PruneExpiredContentTests(unittest.TestCase):
+    def setUp(self):
+        self.original = dict(sync.CONFIG)
+        sync.CONFIG["retention_months"] = 12
+        sync.CONFIG["lookback_days"] = 30
+
+    def tearDown(self):
+        sync.CONFIG.clear()
+        sync.CONFIG.update(self.original)
+
+    def _service(self):
+        return FakeRetentionSheets(
+            posts=[
+                _post_row("old", "2020-01-01T00:00:00+0000"),
+                _post_row("recent", datetime.now(timezone.utc).isoformat()),
+            ],
+            comments=[
+                _child_row(sync.COMMENT_HEADERS, "old"),
+                _child_row(sync.COMMENT_HEADERS, "recent"),
+                _child_row(sync.COMMENT_HEADERS, "old"),
+            ],
+            summaries=[_child_row(sync.SUMMARY_HEADERS, "old")],
+        )
+
+    def test_dry_run_reports_what_would_go_but_deletes_nothing(self):
+        sync.CONFIG["retention_dry_run"] = True
+        service = self._service()
+
+        stats = sync.prune_expired_content(service, "sheet-id")
+
+        self.assertEqual(stats, {"posts": 1, "comments": 2, "summaries": 1})
+        self.assertEqual(service.deleted, [], "dry run must not delete")
+
+    def test_expired_post_is_removed_with_its_comments_and_summary(self):
+        sync.CONFIG["retention_dry_run"] = False
+        service = self._service()
+
+        stats = sync.prune_expired_content(service, "sheet-id")
+
+        self.assertEqual(stats, {"posts": 1, "comments": 2, "summaries": 1})
+        deleted_sheets = {sheet_id for sheet_id, _, _ in service.deleted}
+        self.assertEqual(deleted_sheets, {1, 2, 3}, "all three tabs must be pruned together")
+
+    def test_recent_content_is_left_alone(self):
+        sync.CONFIG["retention_dry_run"] = False
+        service = self._service()
+
+        sync.prune_expired_content(service, "sheet-id")
+
+        # The 'recent' comment sits at sheet row 3 -> start index 2.
+        comment_deletes = [d for d in service.deleted if d[0] == 2]
+        deleted_indexes = set()
+        for _, start, end in comment_deletes:
+            deleted_indexes.update(range(start, end))
+        self.assertNotIn(2, deleted_indexes, "recent comment must survive")
+
+    def test_unparseable_post_date_is_kept_rather_than_guessed(self):
+        sync.CONFIG["retention_dry_run"] = False
+        service = FakeRetentionSheets(
+            posts=[_post_row("mystery", "not-a-date")],
+            comments=[_child_row(sync.COMMENT_HEADERS, "mystery")],
+            summaries=[],
+        )
+
+        stats = sync.prune_expired_content(service, "sheet-id")
+
+        self.assertEqual(stats["posts"], 0)
+        self.assertEqual(service.deleted, [])
+
+    def test_retention_can_be_disabled_entirely(self):
+        sync.CONFIG["retention_months"] = 0
+        sync.CONFIG["retention_dry_run"] = False
+        service = self._service()
+
+        stats = sync.prune_expired_content(service, "sheet-id")
+
+        self.assertEqual(stats, {"posts": 0, "comments": 0, "summaries": 0})
+        self.assertEqual(service.deleted, [])
 
 
 if __name__ == "__main__":
