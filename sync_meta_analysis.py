@@ -21,6 +21,9 @@ DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 WRITE_RESERVE_SECONDS = 90
 ANALYSIS_RESERVE_SECONDS = 4 * 60
 SHEETS_API_RETRIES = 3
+# Spare rows added when a tab's grid has to grow, so a busy sheet is not
+# resized on every run. See ensure_grid_capacity().
+SHEET_ROW_HEADROOM = 500
 
 
 class DeadlineReached(RuntimeError):
@@ -322,7 +325,10 @@ def batch_update(service, spreadsheet_id: str, requests_body: list[dict[str, Any
 def get_spreadsheet(service, spreadsheet_id: str) -> dict[str, Any]:
     return (
         service.spreadsheets()
-        .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title))")
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
+        )
         .execute(num_retries=SHEETS_API_RETRIES)
     )
 
@@ -333,6 +339,70 @@ def find_sheet(metadata: dict[str, Any], title: str) -> dict[str, Any] | None:
         if properties.get("title") == title:
             return properties
     return None
+
+
+def ensure_grid_capacity(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    required_rows: int,
+    required_columns: int,
+) -> None:
+    """Grow a tab's grid so a write can land inside it.
+
+    spreadsheets.values.update writes to an explicit range and does NOT extend
+    the sheet: a range even one row past the grid fails the whole call with
+    "exceeds grid limits", and the run dies. A tab therefore works until the day
+    its data reaches the grid size and then fails permanently, which is exactly
+    how this sync broke once 'Post/Ad Comments' filled its 1540 rows.
+
+    Rows are grown with headroom so a busy tab is not resized on every run.
+    """
+    if required_rows <= 0 and required_columns <= 0:
+        return
+
+    sheet = find_sheet(get_spreadsheet(service, spreadsheet_id), sheet_name)
+    if not sheet:
+        return
+
+    grid = sheet.get("gridProperties") or {}
+    current_rows = int(grid.get("rowCount") or 0)
+    current_columns = int(grid.get("columnCount") or 0)
+
+    target_rows = current_rows
+    target_columns = current_columns
+
+    if required_rows > current_rows:
+        target_rows = required_rows + SHEET_ROW_HEADROOM
+    if required_columns > current_columns:
+        target_columns = required_columns
+
+    if target_rows == current_rows and target_columns == current_columns:
+        return
+
+    log_progress(
+        "sheets",
+        f"Expanding '{sheet_name}' grid: rows {current_rows}->{target_rows}, "
+        f"columns {current_columns}->{target_columns}",
+    )
+    batch_update(
+        service,
+        spreadsheet_id,
+        [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet["sheetId"],
+                        "gridProperties": {
+                            "rowCount": target_rows,
+                            "columnCount": target_columns,
+                        },
+                    },
+                    "fields": "gridProperties.rowCount,gridProperties.columnCount",
+                }
+            }
+        ],
+    )
 
 
 def update_values(service, spreadsheet_id: str, range_name: str, values: list[list[Any]]) -> None:
@@ -723,6 +793,13 @@ def upsert_by_key(
             appended += 1
 
     if merged_values:
+        ensure_grid_capacity(
+            service,
+            spreadsheet_id,
+            sheet_name,
+            len(merged_values) + 1,
+            len(headers),
+        )
         update_values(
             service,
             spreadsheet_id,
@@ -760,12 +837,14 @@ def append_new_rows(
 
     if additions:
         start_row = len(existing) + 2
+        last_row = start_row + len(additions) - 1
+        ensure_grid_capacity(service, spreadsheet_id, sheet_name, last_row, len(headers))
         update_values(
             service,
             spreadsheet_id,
             sheet_range(
                 sheet_name,
-                f"A{start_row}:{col_letter(len(headers))}{start_row + len(additions) - 1}",
+                f"A{start_row}:{col_letter(len(headers))}{last_row}",
             ),
             additions,
         )

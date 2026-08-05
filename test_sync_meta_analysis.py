@@ -717,5 +717,131 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         self.assertEqual(completed[0]["response_value_score"], "")
 
 
+class FakeSheetsGrid:
+    """Minimal stand-in for the Sheets API that enforces the one rule that
+    broke production: values.update fails if the range leaves the grid."""
+
+    def __init__(self, title, row_count, column_count=26):
+        self.title = title
+        self.row_count = row_count
+        self.column_count = column_count
+        self.updates = []
+        self.resizes = []
+
+    # -- plumbing -------------------------------------------------------
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self
+
+    def execute(self, num_retries=0):
+        return self._result
+
+    def get(self, spreadsheetId=None, fields=None, range=None, **kwargs):
+        if range is None:
+            self._result = {
+                "sheets": [
+                    {
+                        "properties": {
+                            "sheetId": 7,
+                            "title": self.title,
+                            "gridProperties": {
+                                "rowCount": self.row_count,
+                                "columnCount": self.column_count,
+                            },
+                        }
+                    }
+                ]
+            }
+        else:
+            self._result = {"values": []}
+        return self
+
+    def update(self, spreadsheetId=None, range=None, valueInputOption=None, body=None, **kwargs):
+        last_row = int(range.split(":")[-1].lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+        if last_row > self.row_count:
+            raise AssertionError(
+                f"Range ({range}) exceeds grid limits. Max rows: {self.row_count}"
+            )
+        self.updates.append(range)
+        self._result = {}
+        return self
+
+    def batchUpdate(self, spreadsheetId=None, body=None, **kwargs):
+        for request in body.get("requests", []):
+            grid = request.get("updateSheetProperties", {}).get("properties", {}).get("gridProperties")
+            if grid:
+                self.resizes.append(grid)
+                self.row_count = grid["rowCount"]
+                self.column_count = grid["columnCount"]
+        self._result = {}
+        return self
+
+
+class GridCapacityTests(unittest.TestCase):
+    """Regression cover for the failure that stopped the sync for a week:
+    'Range (...A1541:T1655) exceeds grid limits. Max rows: 1540'."""
+
+    def test_grid_is_expanded_when_a_write_would_pass_the_last_row(self):
+        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
+
+        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
+
+        self.assertEqual(len(service.resizes), 1)
+        self.assertGreaterEqual(service.resizes[0]["rowCount"], 1655)
+
+    def test_headroom_is_added_so_a_busy_tab_is_not_resized_every_run(self):
+        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
+
+        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
+        first_row_count = service.row_count
+        self.assertEqual(first_row_count, 1655 + sync.SHEET_ROW_HEADROOM)
+
+        # A slightly larger write now fits without another resize.
+        service.resizes.clear()
+        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1700, 20)
+        self.assertEqual(service.resizes, [])
+
+    def test_grid_is_left_alone_when_the_write_already_fits(self):
+        service = FakeSheetsGrid("Post/Ad Comments", row_count=5000)
+
+        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
+
+        self.assertEqual(service.resizes, [])
+
+    def test_columns_are_expanded_too(self):
+        service = FakeSheetsGrid("Posts", row_count=5000, column_count=20)
+
+        sync.ensure_grid_capacity(service, "sheet-id", "Posts", 100, 23)
+
+        self.assertEqual(len(service.resizes), 1)
+        self.assertGreaterEqual(service.resizes[0]["columnCount"], 23)
+
+    def test_missing_sheet_is_ignored_rather_than_raising(self):
+        service = FakeSheetsGrid("Other Tab", row_count=1000)
+
+        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 2000, 20)
+
+        self.assertEqual(service.resizes, [])
+
+    def test_fake_reproduces_the_production_error_without_the_fix(self):
+        """Guards the test itself: the fake must reject an over-grid write."""
+        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
+
+        with self.assertRaisesRegex(AssertionError, "exceeds grid limits"):
+            sync.update_values(
+                service, "sheet-id", "'Post/Ad Comments'!A1541:T1655", [["x"]]
+            )
+
+    def test_write_succeeds_once_capacity_is_ensured(self):
+        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
+
+        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
+        sync.update_values(service, "sheet-id", "'Post/Ad Comments'!A1541:T1655", [["x"]])
+
+        self.assertEqual(service.updates, ["'Post/Ad Comments'!A1541:T1655"])
+
+
 if __name__ == "__main__":
     unittest.main()
