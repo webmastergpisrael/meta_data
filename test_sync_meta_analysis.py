@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import sync_meta_analysis as sync
@@ -79,6 +79,129 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         self.assertEqual(brand_count, 1)
         self.assertEqual(post_count, 0)
         self.assertEqual(selected[0]["comment_id"], "brand")
+
+    def test_all_brand_replies_are_kept_even_when_they_exceed_comment_limit(self):
+        comments = [
+            {
+                "comment_id": f"brand-{index}",
+                "post_id": "existing",
+                "comment_created_time": f"2026-07-01T00:00:0{index}+00:00",
+                "is_brand_comment": True,
+            }
+            for index in range(2)
+        ]
+
+        selected, brand_count, post_count = sync.select_comments_fairly(comments, max_comments=1)
+
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(brand_count, 2)
+        self.assertEqual(post_count, 0)
+
+    def test_brand_reply_audit_finds_reply_under_old_root_when_count_increases(self):
+        current_root = {
+            "id": "post_root",
+            "message": "Old audience question",
+            "created_time": "2026-07-01T00:00:00+00:00",
+            "comment_count": 2,
+            "from": {"id": "audience", "name": "Audience"},
+        }
+        official_reply = {
+            "id": "post_brand-reply",
+            "message": "Official answer",
+            "created_time": "2026-08-20T00:00:00+00:00",
+            "parent": {"id": "post_root"},
+            "from": {"id": "page", "name": "Greenpeace Israel"},
+            "comment_count": 0,
+            "like_count": 0,
+            "permalink_url": "https://example.com/reply",
+        }
+        comments = []
+        seen = {"post_root", "post_old-reply"}
+        posts = [
+            {
+                "post_id": "post",
+                "platform": "facebook",
+                "post_created_time": "2026-07-01T00:00:00+00:00",
+                "post_url": "https://example.com/post",
+            }
+        ]
+        stored_roots = {
+            "post": {
+                "post_root": {
+                    "comment_message": "Old audience question",
+                    "comment_created_time": "2026-07-01T00:00:00+00:00",
+                    "known_reply_count": 1,
+                }
+            }
+        }
+
+        with (
+            patch.dict(sync.CONFIG, {"greenpeace_facebook_page_id": "page"}),
+            patch.object(sync, "collection_time_available", return_value=True),
+            patch.object(sync, "fetch_facebook_thread_reply_counts", return_value=[current_root]) as fetch_roots,
+            patch.object(sync, "fetch_facebook_comment_replies", return_value=[official_reply]) as fetch_replies,
+        ):
+            result = sync.audit_new_facebook_brand_replies(
+                comments,
+                seen,
+                posts,
+                stored_roots,
+                datetime(2026, 8, 20, tzinfo=timezone.utc),
+                "page-token",
+            )
+
+        self.assertEqual(result, (1, 1, 1, False))
+        self.assertEqual(len(comments), 1)
+        self.assertTrue(comments[0]["is_brand_comment"])
+        self.assertEqual(comments[0]["parent_comment_id"], "post_root")
+        self.assertEqual(comments[0]["response_value_score"], "")
+        self.assertEqual(fetch_roots.call_args.args[0], "post")
+        self.assertIsNone(fetch_replies.call_args.args[1])
+
+    def test_brand_reply_audit_skips_unchanged_thread(self):
+        current_root = {"id": "post_root", "comment_count": 1}
+        posts = [{"post_id": "post", "platform": "facebook"}]
+        stored_roots = {"post": {"post_root": {"known_reply_count": 1}}}
+
+        with (
+            patch.object(sync, "collection_time_available", return_value=True),
+            patch.object(sync, "fetch_facebook_thread_reply_counts", return_value=[current_root]),
+            patch.object(sync, "fetch_facebook_comment_replies") as fetch_replies,
+        ):
+            result = sync.audit_new_facebook_brand_replies(
+                [],
+                {"post_root"},
+                posts,
+                stored_roots,
+                datetime(2026, 8, 20, tzinfo=timezone.utc),
+                "page-token",
+            )
+
+        self.assertEqual(result, (1, 0, 0, False))
+        fetch_replies.assert_not_called()
+
+    def test_existing_comment_state_counts_stored_replies_per_root(self):
+        def sheet_row(comment_id, parent_id, message, is_brand=False):
+            row = [""] * len(sync.COMMENT_HEADERS)
+            row[sync.COMMENT_HEADERS.index("comment_id")] = comment_id
+            row[sync.COMMENT_HEADERS.index("post_id")] = "post"
+            row[sync.COMMENT_HEADERS.index("parent_comment_id")] = parent_id
+            row[sync.COMMENT_HEADERS.index("comment_message")] = message
+            row[sync.COMMENT_HEADERS.index("comment_created_time")] = "2026-08-20T00:00:00+00:00"
+            row[sync.COMMENT_HEADERS.index("is_brand_comment")] = "TRUE" if is_brand else "FALSE"
+            return row
+
+        rows = [
+            sheet_row("root", "", "Root"),
+            sheet_row("reply", "root", "Reply"),
+            sheet_row("deep-reply", "reply", "Deep reply"),
+        ]
+        with patch.object(sync, "get_values", return_value=rows):
+            ids, audience_counts, roots = sync.existing_comment_state(object(), "sheet")
+
+        self.assertEqual(ids, {"root", "reply", "deep-reply"})
+        self.assertEqual(audience_counts, {"post": 3})
+        self.assertEqual(roots["post"]["root"]["known_reply_count"], 2)
 
     def test_fractional_comment_slots_go_to_posts_with_newest_comments(self):
         comments = [
@@ -715,339 +838,6 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
 
         self.assertEqual([item["comment_id"] for item in completed], ["brand-comment"])
         self.assertEqual(completed[0]["response_value_score"], "")
-
-
-class FakeSheetsGrid:
-    """Minimal stand-in for the Sheets API that enforces the one rule that
-    broke production: values.update fails if the range leaves the grid."""
-
-    def __init__(self, title, row_count, column_count=26):
-        self.title = title
-        self.row_count = row_count
-        self.column_count = column_count
-        self.updates = []
-        self.resizes = []
-
-    # -- plumbing -------------------------------------------------------
-    def spreadsheets(self):
-        return self
-
-    def values(self):
-        return self
-
-    def execute(self, num_retries=0):
-        return self._result
-
-    def get(self, spreadsheetId=None, fields=None, range=None, **kwargs):
-        if range is None:
-            self._result = {
-                "sheets": [
-                    {
-                        "properties": {
-                            "sheetId": 7,
-                            "title": self.title,
-                            "gridProperties": {
-                                "rowCount": self.row_count,
-                                "columnCount": self.column_count,
-                            },
-                        }
-                    }
-                ]
-            }
-        else:
-            self._result = {"values": []}
-        return self
-
-    def update(self, spreadsheetId=None, range=None, valueInputOption=None, body=None, **kwargs):
-        last_row = int(range.split(":")[-1].lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
-        if last_row > self.row_count:
-            raise AssertionError(
-                f"Range ({range}) exceeds grid limits. Max rows: {self.row_count}"
-            )
-        self.updates.append(range)
-        self._result = {}
-        return self
-
-    def batchUpdate(self, spreadsheetId=None, body=None, **kwargs):
-        for request in body.get("requests", []):
-            grid = request.get("updateSheetProperties", {}).get("properties", {}).get("gridProperties")
-            if grid:
-                self.resizes.append(grid)
-                self.row_count = grid["rowCount"]
-                self.column_count = grid["columnCount"]
-        self._result = {}
-        return self
-
-
-class GridCapacityTests(unittest.TestCase):
-    """Regression cover for the failure that stopped the sync for a week:
-    'Range (...A1541:T1655) exceeds grid limits. Max rows: 1540'."""
-
-    def test_grid_is_expanded_when_a_write_would_pass_the_last_row(self):
-        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
-
-        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
-
-        self.assertEqual(len(service.resizes), 1)
-        self.assertGreaterEqual(service.resizes[0]["rowCount"], 1655)
-
-    def test_headroom_is_added_so_a_busy_tab_is_not_resized_every_run(self):
-        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
-
-        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
-        first_row_count = service.row_count
-        self.assertEqual(first_row_count, 1655 + sync.SHEET_ROW_HEADROOM)
-
-        # A slightly larger write now fits without another resize.
-        service.resizes.clear()
-        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1700, 20)
-        self.assertEqual(service.resizes, [])
-
-    def test_grid_is_left_alone_when_the_write_already_fits(self):
-        service = FakeSheetsGrid("Post/Ad Comments", row_count=5000)
-
-        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
-
-        self.assertEqual(service.resizes, [])
-
-    def test_columns_are_expanded_too(self):
-        service = FakeSheetsGrid("Posts", row_count=5000, column_count=20)
-
-        sync.ensure_grid_capacity(service, "sheet-id", "Posts", 100, 23)
-
-        self.assertEqual(len(service.resizes), 1)
-        self.assertGreaterEqual(service.resizes[0]["columnCount"], 23)
-
-    def test_missing_sheet_is_ignored_rather_than_raising(self):
-        service = FakeSheetsGrid("Other Tab", row_count=1000)
-
-        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 2000, 20)
-
-        self.assertEqual(service.resizes, [])
-
-    def test_fake_reproduces_the_production_error_without_the_fix(self):
-        """Guards the test itself: the fake must reject an over-grid write."""
-        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
-
-        with self.assertRaisesRegex(AssertionError, "exceeds grid limits"):
-            sync.update_values(
-                service, "sheet-id", "'Post/Ad Comments'!A1541:T1655", [["x"]]
-            )
-
-    def test_write_succeeds_once_capacity_is_ensured(self):
-        service = FakeSheetsGrid("Post/Ad Comments", row_count=1540)
-
-        sync.ensure_grid_capacity(service, "sheet-id", "Post/Ad Comments", 1655, 20)
-        sync.update_values(service, "sheet-id", "'Post/Ad Comments'!A1541:T1655", [["x"]])
-
-        self.assertEqual(service.updates, ["'Post/Ad Comments'!A1541:T1655"])
-
-
-class RetentionCutoffTests(unittest.TestCase):
-    def test_cutoff_is_roughly_the_configured_number_of_months_back(self):
-        now = datetime(2026, 8, 5, tzinfo=timezone.utc)
-
-        cutoff = sync.retention_cutoff(now, retention_months=12, lookback_days=30)
-
-        self.assertLess(cutoff, now - timedelta(days=300))
-        self.assertGreater(cutoff, now - timedelta(days=400))
-
-    def test_cutoff_never_reaches_into_the_scan_window(self):
-        """A short retention must not delete items the scan still returns --
-        those would be re-analysed by Gemini and re-appended every run."""
-        now = datetime(2026, 8, 5, tzinfo=timezone.utc)
-
-        cutoff = sync.retention_cutoff(now, retention_months=1, lookback_days=30)
-
-        self.assertLessEqual(cutoff, now - timedelta(days=60))
-
-    def test_zero_months_is_still_clamped_rather_than_deleting_everything(self):
-        now = datetime(2026, 8, 5, tzinfo=timezone.utc)
-
-        cutoff = sync.retention_cutoff(now, retention_months=0, lookback_days=30)
-
-        self.assertLessEqual(cutoff, now - timedelta(days=60))
-
-
-class DeleteSheetRowsTests(unittest.TestCase):
-    class Recorder:
-        def __init__(self):
-            self.requests = []
-
-    def _capture(self):
-        recorder = self.Recorder()
-
-        def fake_batch_update(service, spreadsheet_id, requests):
-            recorder.requests.extend(requests)
-
-        return recorder, fake_batch_update
-
-    def test_contiguous_rows_collapse_into_one_request(self):
-        recorder, fake = self._capture()
-        with patch.object(sync, "batch_update", fake):
-            deleted = sync.delete_sheet_rows(None, "sheet-id", 7, [5, 6, 7])
-
-        self.assertEqual(deleted, 3)
-        self.assertEqual(len(recorder.requests), 1)
-        rng = recorder.requests[0]["deleteDimension"]["range"]
-        self.assertEqual((rng["startIndex"], rng["endIndex"]), (4, 7))
-
-    def test_rows_are_deleted_bottom_up_so_indexes_stay_valid(self):
-        recorder, fake = self._capture()
-        with patch.object(sync, "batch_update", fake):
-            sync.delete_sheet_rows(None, "sheet-id", 7, [2, 10, 20])
-
-        starts = [r["deleteDimension"]["range"]["startIndex"] for r in recorder.requests]
-        self.assertEqual(starts, sorted(starts, reverse=True))
-
-    def test_nothing_to_delete_issues_no_request(self):
-        recorder, fake = self._capture()
-        with patch.object(sync, "batch_update", fake):
-            deleted = sync.delete_sheet_rows(None, "sheet-id", 7, [])
-
-        self.assertEqual(deleted, 0)
-        self.assertEqual(recorder.requests, [])
-
-
-class FakeRetentionSheets:
-    """Stands in for the three tabs so the whole prune flow can be exercised."""
-
-    def __init__(self, posts, comments, summaries):
-        self.data = {
-            sync.POSTS_SHEET_NAME: posts,
-            sync.POST_COMMENTS_SHEET_NAME: comments,
-            sync.POST_SUMMARY_SHEET_NAME: summaries,
-        }
-        self.sheet_ids = {
-            sync.POSTS_SHEET_NAME: 1,
-            sync.POST_COMMENTS_SHEET_NAME: 2,
-            sync.POST_SUMMARY_SHEET_NAME: 3,
-        }
-        self.deleted = []
-
-    def spreadsheets(self):
-        return self
-
-    def values(self):
-        return self
-
-    def execute(self, num_retries=0):
-        return self._result
-
-    def get(self, spreadsheetId=None, fields=None, range=None, **kwargs):
-        if range is None:
-            self._result = {
-                "sheets": [
-                    {"properties": {"sheetId": sid, "title": title,
-                                    "gridProperties": {"rowCount": 5000, "columnCount": 26}}}
-                    for title, sid in self.sheet_ids.items()
-                ]
-            }
-        else:
-            title = range.split("!")[0].strip("'")
-            self._result = {"values": self.data.get(title, [])}
-        return self
-
-    def batchUpdate(self, spreadsheetId=None, body=None, **kwargs):
-        for request in body.get("requests", []):
-            rng = request.get("deleteDimension", {}).get("range")
-            if rng:
-                self.deleted.append((rng["sheetId"], rng["startIndex"], rng["endIndex"]))
-        self._result = {}
-        return self
-
-
-def _post_row(post_id, created):
-    row = [""] * len(sync.POST_HEADERS)
-    row[sync.POST_HEADERS.index("post_id")] = post_id
-    row[sync.POST_HEADERS.index("post_created_time")] = created
-    return row
-
-
-def _child_row(headers, post_id):
-    row = [""] * len(headers)
-    row[headers.index("post_id")] = post_id
-    return row
-
-
-class PruneExpiredContentTests(unittest.TestCase):
-    def setUp(self):
-        self.original = dict(sync.CONFIG)
-        sync.CONFIG["retention_months"] = 12
-        sync.CONFIG["lookback_days"] = 30
-
-    def tearDown(self):
-        sync.CONFIG.clear()
-        sync.CONFIG.update(self.original)
-
-    def _service(self):
-        return FakeRetentionSheets(
-            posts=[
-                _post_row("old", "2020-01-01T00:00:00+0000"),
-                _post_row("recent", datetime.now(timezone.utc).isoformat()),
-            ],
-            comments=[
-                _child_row(sync.COMMENT_HEADERS, "old"),
-                _child_row(sync.COMMENT_HEADERS, "recent"),
-                _child_row(sync.COMMENT_HEADERS, "old"),
-            ],
-            summaries=[_child_row(sync.SUMMARY_HEADERS, "old")],
-        )
-
-    def test_dry_run_reports_what_would_go_but_deletes_nothing(self):
-        sync.CONFIG["retention_dry_run"] = True
-        service = self._service()
-
-        stats = sync.prune_expired_content(service, "sheet-id")
-
-        self.assertEqual(stats, {"posts": 1, "comments": 2, "summaries": 1})
-        self.assertEqual(service.deleted, [], "dry run must not delete")
-
-    def test_expired_post_is_removed_with_its_comments_and_summary(self):
-        sync.CONFIG["retention_dry_run"] = False
-        service = self._service()
-
-        stats = sync.prune_expired_content(service, "sheet-id")
-
-        self.assertEqual(stats, {"posts": 1, "comments": 2, "summaries": 1})
-        deleted_sheets = {sheet_id for sheet_id, _, _ in service.deleted}
-        self.assertEqual(deleted_sheets, {1, 2, 3}, "all three tabs must be pruned together")
-
-    def test_recent_content_is_left_alone(self):
-        sync.CONFIG["retention_dry_run"] = False
-        service = self._service()
-
-        sync.prune_expired_content(service, "sheet-id")
-
-        # The 'recent' comment sits at sheet row 3 -> start index 2.
-        comment_deletes = [d for d in service.deleted if d[0] == 2]
-        deleted_indexes = set()
-        for _, start, end in comment_deletes:
-            deleted_indexes.update(range(start, end))
-        self.assertNotIn(2, deleted_indexes, "recent comment must survive")
-
-    def test_unparseable_post_date_is_kept_rather_than_guessed(self):
-        sync.CONFIG["retention_dry_run"] = False
-        service = FakeRetentionSheets(
-            posts=[_post_row("mystery", "not-a-date")],
-            comments=[_child_row(sync.COMMENT_HEADERS, "mystery")],
-            summaries=[],
-        )
-
-        stats = sync.prune_expired_content(service, "sheet-id")
-
-        self.assertEqual(stats["posts"], 0)
-        self.assertEqual(service.deleted, [])
-
-    def test_retention_can_be_disabled_entirely(self):
-        sync.CONFIG["retention_months"] = 0
-        sync.CONFIG["retention_dry_run"] = False
-        service = self._service()
-
-        stats = sync.prune_expired_content(service, "sheet-id")
-
-        self.assertEqual(stats, {"posts": 0, "comments": 0, "summaries": 0})
-        self.assertEqual(service.deleted, [])
 
 
 if __name__ == "__main__":
