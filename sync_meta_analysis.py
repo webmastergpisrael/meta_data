@@ -21,9 +21,6 @@ DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 WRITE_RESERVE_SECONDS = 90
 ANALYSIS_RESERVE_SECONDS = 4 * 60
 SHEETS_API_RETRIES = 3
-# Spare rows added when a tab's grid has to grow, so a busy sheet is not
-# resized on every run. See ensure_grid_capacity().
-SHEET_ROW_HEADROOM = 500
 
 
 class DeadlineReached(RuntimeError):
@@ -222,13 +219,6 @@ CONFIG = {
     "max_comments_per_run": env_int("MAX_COMMENTS_PER_RUN", 500),
     "max_content_items_per_run": env_int("MAX_CONTENT_ITEMS_PER_RUN", 100),
     "full_scan_interval_days": env_int("FULL_SCAN_INTERVAL_DAYS", 30),
-    # Retention. Posts older than this, and their comments and summaries, are
-    # removed so the spreadsheet stays workable. 0 disables pruning entirely.
-    "retention_months": env_int("RETENTION_MONTHS", 12),
-    # Starts in report-only mode on purpose: deletion cannot be undone, so the
-    # first runs log exactly what would go and delete nothing. Set
-    # RETENTION_DRY_RUN=false once the reported numbers look right.
-    "retention_dry_run": env_bool("RETENTION_DRY_RUN", True),
     "delta_overlap_hours": env_int("DELTA_OVERLAP_HOURS", 24),
     "max_runtime_seconds": env_int("MAX_RUNTIME_SECONDS", DEFAULT_MAX_RUNTIME_SECONDS),
     "run_started_monotonic": 0.0,
@@ -332,10 +322,7 @@ def batch_update(service, spreadsheet_id: str, requests_body: list[dict[str, Any
 def get_spreadsheet(service, spreadsheet_id: str) -> dict[str, Any]:
     return (
         service.spreadsheets()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            fields="sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))",
-        )
+        .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title))")
         .execute(num_retries=SHEETS_API_RETRIES)
     )
 
@@ -346,70 +333,6 @@ def find_sheet(metadata: dict[str, Any], title: str) -> dict[str, Any] | None:
         if properties.get("title") == title:
             return properties
     return None
-
-
-def ensure_grid_capacity(
-    service,
-    spreadsheet_id: str,
-    sheet_name: str,
-    required_rows: int,
-    required_columns: int,
-) -> None:
-    """Grow a tab's grid so a write can land inside it.
-
-    spreadsheets.values.update writes to an explicit range and does NOT extend
-    the sheet: a range even one row past the grid fails the whole call with
-    "exceeds grid limits", and the run dies. A tab therefore works until the day
-    its data reaches the grid size and then fails permanently, which is exactly
-    how this sync broke once 'Post/Ad Comments' filled its 1540 rows.
-
-    Rows are grown with headroom so a busy tab is not resized on every run.
-    """
-    if required_rows <= 0 and required_columns <= 0:
-        return
-
-    sheet = find_sheet(get_spreadsheet(service, spreadsheet_id), sheet_name)
-    if not sheet:
-        return
-
-    grid = sheet.get("gridProperties") or {}
-    current_rows = int(grid.get("rowCount") or 0)
-    current_columns = int(grid.get("columnCount") or 0)
-
-    target_rows = current_rows
-    target_columns = current_columns
-
-    if required_rows > current_rows:
-        target_rows = required_rows + SHEET_ROW_HEADROOM
-    if required_columns > current_columns:
-        target_columns = required_columns
-
-    if target_rows == current_rows and target_columns == current_columns:
-        return
-
-    log_progress(
-        "sheets",
-        f"Expanding '{sheet_name}' grid: rows {current_rows}->{target_rows}, "
-        f"columns {current_columns}->{target_columns}",
-    )
-    batch_update(
-        service,
-        spreadsheet_id,
-        [
-            {
-                "updateSheetProperties": {
-                    "properties": {
-                        "sheetId": sheet["sheetId"],
-                        "gridProperties": {
-                            "rowCount": target_rows,
-                            "columnCount": target_columns,
-                        },
-                    },
-                    "fields": "gridProperties.rowCount,gridProperties.columnCount",
-                }
-            }
-        ],
-    )
 
 
 def update_values(service, spreadsheet_id: str, range_name: str, values: list[list[Any]]) -> None:
@@ -696,8 +619,8 @@ def existing_ids(service, spreadsheet_id: str, sheet_name: str, headers: list[st
 def existing_comment_state(
     service,
     spreadsheet_id: str,
-) -> tuple[set[str], dict[str, int]]:
-    """Load existing comment IDs and audience counts per post in one Sheets read."""
+) -> tuple[set[str], dict[str, int], dict[str, dict[str, dict[str, Any]]]]:
+    """Load IDs, audience counts, and stored Facebook thread state in one read."""
     rows = get_values(
         service,
         spreadsheet_id,
@@ -706,18 +629,73 @@ def existing_comment_state(
     comment_id_index = COMMENT_HEADERS.index("comment_id")
     post_id_index = COMMENT_HEADERS.index("post_id")
     brand_index = COMMENT_HEADERS.index("is_brand_comment")
+    parent_index = COMMENT_HEADERS.index("parent_comment_id")
+    message_index = COMMENT_HEADERS.index("comment_message")
+    created_index = COMMENT_HEADERS.index("comment_created_time")
     comment_ids: set[str] = set()
     audience_counts: dict[str, int] = defaultdict(int)
+    records: list[dict[str, Any]] = []
     for raw_row in rows:
         row = pad_row(raw_row, len(COMMENT_HEADERS))
         comment_id = str(row[comment_id_index] or "").strip()
         post_id = str(row[post_id_index] or "").strip()
+        parent_id = str(row[parent_index] or "").strip()
         is_brand = str(row[brand_index] or "").strip().lower() == "true"
         if comment_id:
             comment_ids.add(comment_id)
         if post_id and comment_id and not is_brand:
             audience_counts[post_id] += 1
-    return comment_ids, dict(audience_counts)
+        if post_id and comment_id:
+            records.append(
+                {
+                    "comment_id": comment_id,
+                    "post_id": post_id,
+                    "parent_comment_id": parent_id,
+                    "comment_message": str(row[message_index] or ""),
+                    "comment_created_time": str(row[created_index] or ""),
+                    "is_brand_comment": is_brand,
+                }
+            )
+
+    records_by_key = {
+        (record["post_id"], record["comment_id"]): record
+        for record in records
+    }
+
+    def stored_root_id(record: dict[str, Any]) -> str:
+        current = record
+        visited: set[str] = set()
+        while current.get("parent_comment_id"):
+            parent_id = str(current["parent_comment_id"])
+            if parent_id in visited:
+                break
+            visited.add(parent_id)
+            parent = records_by_key.get((str(current["post_id"]), parent_id))
+            if not parent:
+                return parent_id
+            current = parent
+        return str(current.get("comment_id") or "")
+
+    thread_roots: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for record in records:
+        if not record.get("parent_comment_id"):
+            thread_roots[record["post_id"]][record["comment_id"]] = {
+                "comment_message": record["comment_message"],
+                "comment_created_time": record["comment_created_time"],
+                "known_reply_count": 0,
+            }
+    for record in records:
+        if not record.get("parent_comment_id"):
+            continue
+        root_id = stored_root_id(record)
+        root = thread_roots.get(record["post_id"], {}).get(root_id)
+        if root is not None:
+            root["known_reply_count"] += 1
+
+    return comment_ids, dict(audience_counts), {
+        post_id: dict(roots)
+        for post_id, roots in thread_roots.items()
+    }
 
 
 def existing_post_state(
@@ -800,13 +778,6 @@ def upsert_by_key(
             appended += 1
 
     if merged_values:
-        ensure_grid_capacity(
-            service,
-            spreadsheet_id,
-            sheet_name,
-            len(merged_values) + 1,
-            len(headers),
-        )
         update_values(
             service,
             spreadsheet_id,
@@ -844,14 +815,12 @@ def append_new_rows(
 
     if additions:
         start_row = len(existing) + 2
-        last_row = start_row + len(additions) - 1
-        ensure_grid_capacity(service, spreadsheet_id, sheet_name, last_row, len(headers))
         update_values(
             service,
             spreadsheet_id,
             sheet_range(
                 sheet_name,
-                f"A{start_row}:{col_letter(len(headers))}{last_row}",
+                f"A{start_row}:{col_letter(len(headers))}{start_row + len(additions) - 1}",
             ),
             additions,
         )
@@ -1137,12 +1106,12 @@ def fetch_instagram_media(ig_user_id: str, since_date: datetime, until_date: dat
     return [item for item in media if is_within(item.get("timestamp", ""), since_date, until_date)]
 
 
-def fetch_facebook_comments_with_replies(
+def fetch_facebook_top_level_comments(
     object_id: str,
     since_date: datetime | None,
     until_date: datetime,
     access_token: str,
-):
+) -> list[dict[str, Any]]:
     top_level_params: dict[str, Any] = {
         "fields": FACEBOOK_COMMENT_FIELDS,
         "filter": "toplevel",
@@ -1160,29 +1129,73 @@ def fetch_facebook_comments_with_replies(
     )
     if since_date:
         comments = [comment for comment in comments if is_within(comment.get("created_time", ""), since_date, until_date)]
-    for comment in comments:
-        if not collection_time_available():
-            break
-        reply_params: dict[str, Any] = {
-            "fields": FACEBOOK_COMMENT_FIELDS,
+    return comments
+
+
+def fetch_facebook_thread_reply_counts(
+    object_id: str,
+    until_date: datetime,
+    access_token: str,
+) -> list[dict[str, Any]]:
+    """Fetch only root IDs and reply counts for the low-cost official-reply audit."""
+    return get_all_pages(
+        f"/{object_id}/comments",
+        {
+            "fields": "id,comment_count",
+            "filter": "toplevel",
             "order": "chronological",
             "until": to_unix(until_date),
             "limit": 100,
-        }
-        if since_date:
-            reply_params["since"] = to_unix(since_date)
-        replies = get_all_pages(
-            f"/{comment.get('id', '')}/comments",
-            reply_params,
-            access_token,
-            0,
-        )
+        },
+        access_token,
+        0,
+    )
+
+
+def fetch_facebook_comment_replies(
+    comment_id: str,
+    since_date: datetime | None,
+    until_date: datetime,
+    access_token: str,
+) -> list[dict[str, Any]]:
+    reply_params: dict[str, Any] = {
+        "fields": FACEBOOK_COMMENT_FIELDS,
+        "order": "chronological",
+        "until": to_unix(until_date),
+        "limit": 100,
+    }
+    if since_date:
+        reply_params["since"] = to_unix(since_date)
+    replies = get_all_pages(
+        f"/{comment_id}/comments",
+        reply_params,
+        access_token,
+        0,
+    )
+    return [
+        reply
+        for reply in replies
+        if not since_date or is_within(reply.get("created_time", ""), since_date, until_date)
+    ]
+
+
+def fetch_facebook_comments_with_replies(
+    object_id: str,
+    since_date: datetime | None,
+    until_date: datetime,
+    access_token: str,
+):
+    comments = fetch_facebook_top_level_comments(object_id, since_date, until_date, access_token)
+    for comment in comments:
+        if not collection_time_available():
+            break
         comment["comments"] = {
-            "data": [
-                reply
-                for reply in replies
-                if not since_date or is_within(reply.get("created_time", ""), since_date, until_date)
-            ]
+            "data": fetch_facebook_comment_replies(
+                str(comment.get("id") or ""),
+                since_date,
+                until_date,
+                access_token,
+            )
         }
     return comments
 
@@ -1469,6 +1482,110 @@ def collect_visible_comments(
             )
 
 
+def audit_new_facebook_brand_replies(
+    comments: list[dict[str, Any]],
+    seen: set[str],
+    existing_posts: list[dict[str, Any]],
+    stored_thread_roots: dict[str, dict[str, dict[str, Any]]],
+    until_date: datetime,
+    access_token: str,
+) -> tuple[int, int, int, bool]:
+    """Find new official replies even when their top-level parent is outside the delta window."""
+    audited_posts = 0
+    changed_threads = 0
+    brand_replies = 0
+    incomplete = False
+    facebook_posts = sorted(
+        (
+            post
+            for post in existing_posts
+            if str(post.get("platform") or "").lower() == "facebook"
+            and stored_thread_roots.get(str(post.get("post_id") or ""))
+        ),
+        key=lambda post: (
+            meta_date_sort_key(post, "post_created_time"),
+            str(post.get("post_id") or ""),
+        ),
+        reverse=True,
+    )
+
+    for post in facebook_posts:
+        if not collection_time_available():
+            incomplete = True
+            break
+        post_id = str(post.get("post_id") or "")
+        stored_roots = stored_thread_roots.get(post_id, {})
+        try:
+            current_roots = fetch_facebook_thread_reply_counts(
+                post_id,
+                until_date,
+                access_token,
+            )
+        except MetaAPIError as exc:
+            log_progress("brand-audit", f"Skipping Facebook post {post_id}: {exc}")
+            continue
+        audited_posts += 1
+
+        for raw_root in current_roots:
+            root_id = str(raw_root.get("id") or "")
+            stored_root = stored_roots.get(root_id)
+            if not stored_root:
+                continue
+            try:
+                current_reply_count = int(raw_root.get("comment_count") or 0)
+            except (TypeError, ValueError):
+                current_reply_count = 0
+            known_reply_count = int(stored_root.get("known_reply_count") or 0)
+            if current_reply_count <= known_reply_count:
+                continue
+            if not collection_time_available():
+                incomplete = True
+                break
+
+            changed_threads += 1
+            try:
+                replies = fetch_facebook_comment_replies(
+                    root_id,
+                    None,
+                    until_date,
+                    access_token,
+                )
+            except MetaAPIError as exc:
+                log_progress("brand-audit", f"Skipping Facebook thread {root_id}: {exc}")
+                continue
+
+            thread_comments_by_id = {
+                str(item.get("id") or ""): item
+                for item in [raw_root, *replies]
+                if item.get("id")
+            }
+            for reply in replies:
+                reply_id = str(reply.get("id") or "")
+                if not reply_id or reply_id in seen or not is_greenpeace_raw_comment(reply, "facebook"):
+                    continue
+                parent_id = str(reply.get("parent", {}).get("id") or root_id)
+                parent = thread_comments_by_id.get(parent_id, raw_root)
+                row = add_comment(
+                    comments,
+                    seen,
+                    "facebook",
+                    post_id,
+                    reply,
+                    parent_id,
+                    comment_text(parent, "facebook") or str(stored_root.get("comment_message") or ""),
+                    str(post.get("post_url") or ""),
+                    raw_commenter_name(parent, "facebook"),
+                    is_greenpeace_raw_comment(parent, "facebook"),
+                )
+                if row:
+                    clear_brand_comment_analysis(row)
+                    brand_replies += 1
+        if incomplete:
+            break
+
+    return audited_posts, changed_threads, brand_replies, incomplete
+
+
 def select_oldest_comments(comments: list[dict[str, Any]], max_comments: int) -> list[dict[str, Any]]:
     if max_comments < 1:
         raise RuntimeError("MAX_COMMENTS_PER_RUN must be at least 1")
@@ -1497,9 +1614,11 @@ def select_comments_fairly(
         ),
     )
     brand_comments = [comment for comment in chronological if comment.get("is_brand_comment")]
-    selected = brand_comments[:max_comments]
+    # Official replies are reconciliation signals, not analysis workload. Never
+    # defer them behind the audience-comment quota, even in an unusually busy run.
+    selected = list(brand_comments)
     brand_selected = len(selected)
-    remaining = max_comments - brand_selected
+    remaining = max(0, max_comments - brand_selected)
     if remaining <= 0:
         return selected, brand_selected, 0
 
@@ -1628,11 +1747,13 @@ def collect_rows(
     existing_audience_counts: dict[str, int] | None = None,
     existing_post_last_scanned: dict[str, datetime] | None = None,
     existing_posts: list[dict[str, Any]] | None = None,
+    stored_thread_roots: dict[str, dict[str, dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     existing_post_ids = existing_post_ids or set()
     existing_comment_ids = existing_comment_ids or set()
     existing_post_last_scanned = existing_post_last_scanned or {}
     existing_posts = existing_posts or []
+    stored_thread_roots = stored_thread_roots or {}
     if not existing_posts:
         existing_posts = [
             {
@@ -1700,6 +1821,20 @@ def collect_rows(
                 "object not found",
             )
         )
+
+    audited_posts, changed_threads, audited_brand_replies, brand_audit_incomplete = audit_new_facebook_brand_replies(
+        comments,
+        seen_comments,
+        existing_posts,
+        stored_thread_roots,
+        window_end,
+        page_token,
+    )
+    log_progress(
+        "brand-audit",
+        f"Audited {audited_posts} Facebook posts / {changed_threads} changed threads; "
+        f"new official replies={audited_brand_replies}; incomplete={str(brand_audit_incomplete).lower()}",
+    )
 
     log_progress("collect", f"Loading discovery lists; global content limit={max_content_items}")
     facebook_posts = fetch_facebook_posts(meta_context["page_id"], window_start, window_end, window_start, page_token)
@@ -2707,154 +2842,6 @@ def reconcile_brand_thread_response_scores(service, spreadsheet_id: str) -> int:
     return changed
 
 
-def retention_cutoff(now: datetime, retention_months: int, lookback_days: int) -> datetime:
-    """Oldest date worth keeping.
-
-    Clamped so it can never reach into the scan window. The sheet is also the
-    de-duplication memory: the run skips anything whose id it already finds
-    there. Delete something the scan still returns and it is treated as new,
-    re-sent to Gemini and re-appended on every run -- a loop that costs money.
-    """
-    months = max(0, retention_months)
-    cutoff = now - timedelta(days=months * 30)
-    floor = now - timedelta(days=max(1, lookback_days) * 2)
-    return min(cutoff, floor)
-
-
-def delete_sheet_rows(service, spreadsheet_id: str, sheet_id: int, row_indexes: list[int]) -> int:
-    """Delete 1-based sheet rows.
-
-    Deleting shifts everything below it up, so contiguous runs are collapsed
-    into single requests and issued bottom-up to keep the remaining indexes
-    valid.
-    """
-    if not row_indexes:
-        return 0
-
-    ordered = sorted(set(row_indexes))
-    blocks: list[tuple[int, int]] = []
-    for row in ordered:
-        if blocks and row == blocks[-1][1] + 1:
-            blocks[-1] = (blocks[-1][0], row)
-        else:
-            blocks.append((row, row))
-
-    requests = [
-        {
-            "deleteDimension": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "ROWS",
-                    "startIndex": start - 1,  # API is 0-based, half-open
-                    "endIndex": end,
-                }
-            }
-        }
-        for start, end in reversed(blocks)
-    ]
-    batch_update(service, spreadsheet_id, requests)
-    return len(ordered)
-
-
-def prune_expired_content(service, spreadsheet_id: str) -> dict[str, int]:
-    """Drop posts past the retention window, with their comments and summaries.
-
-    Whole posts are removed rather than merely the oldest N comment rows,
-    because refresh_derived_metrics() recomputes each post's comment counters
-    from whatever comments remain in the sheet. Deleting comments alone would
-    silently rewrite old posts' counters to zero and leave the Posts and
-    Summary tabs disagreeing with reality.
-    """
-    stats = {"posts": 0, "comments": 0, "summaries": 0}
-    retention_months = int(CONFIG.get("retention_months") or 0)
-
-    if retention_months <= 0:
-        return stats
-
-    cutoff = retention_cutoff(
-        datetime.now(timezone.utc),
-        retention_months,
-        int(CONFIG.get("lookback_days") or 30),
-    )
-    metadata = get_spreadsheet(service, spreadsheet_id)
-
-    post_rows = get_values(
-        service,
-        spreadsheet_id,
-        sheet_range(POSTS_SHEET_NAME, f"A2:{col_letter(len(POST_HEADERS))}"),
-    )
-    created_index = POST_HEADERS.index("post_created_time")
-    post_id_index = POST_HEADERS.index("post_id")
-
-    expired_post_ids: set[str] = set()
-    expired_post_rows: list[int] = []
-    for offset, raw_row in enumerate(post_rows):
-        row = pad_row(raw_row, len(POST_HEADERS))
-        created = parse_meta_date(str(row[created_index] or ""))
-        # An unparseable date is kept: better a slightly larger sheet than
-        # deleting something whose age cannot be established.
-        if not created or created >= cutoff:
-            continue
-        post_id = str(row[post_id_index] or "").strip()
-        if not post_id:
-            continue
-        expired_post_ids.add(post_id)
-        expired_post_rows.append(offset + 2)
-
-    if not expired_post_ids:
-        return stats
-
-    def expired_rows_in(sheet_name: str, headers: list[str]) -> list[int]:
-        rows = get_values(
-            service,
-            spreadsheet_id,
-            sheet_range(sheet_name, f"A2:{col_letter(len(headers))}"),
-        )
-        index = headers.index("post_id")
-        return [
-            offset + 2
-            for offset, raw_row in enumerate(rows)
-            if str(pad_row(raw_row, len(headers))[index] or "").strip() in expired_post_ids
-        ]
-
-    comment_rows = expired_rows_in(POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS)
-    summary_rows = expired_rows_in(POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS)
-
-    stats = {
-        "posts": len(expired_post_rows),
-        "comments": len(comment_rows),
-        "summaries": len(summary_rows),
-    }
-
-    if CONFIG.get("retention_dry_run", True):
-        log_progress(
-            "retention",
-            f"DRY RUN, nothing deleted: {stats['posts']} posts, {stats['comments']} comments, "
-            f"{stats['summaries']} summaries are older than {cutoff.date()} "
-            f"(RETENTION_MONTHS={retention_months}). Set RETENTION_DRY_RUN=false to apply.",
-        )
-        return stats
-
-    # Comments and summaries first: if the run dies midway, orphaned children
-    # are harmless, whereas posts without their comments would have their
-    # counters rewritten to zero by refresh_derived_metrics().
-    for sheet_name, headers, rows in (
-        (POST_COMMENTS_SHEET_NAME, COMMENT_HEADERS, comment_rows),
-        (POST_SUMMARY_SHEET_NAME, SUMMARY_HEADERS, summary_rows),
-        (POSTS_SHEET_NAME, POST_HEADERS, expired_post_rows),
-    ):
-        sheet = find_sheet(metadata, sheet_name)
-        if sheet and rows:
-            delete_sheet_rows(service, spreadsheet_id, sheet["sheetId"], rows)
-
-    log_progress(
-        "retention",
-        f"Pruned content older than {cutoff.date()}: {stats['posts']} posts, "
-        f"{stats['comments']} comments, {stats['summaries']} summaries",
-    )
-    return stats
-
-
 def refresh_derived_metrics(service, spreadsheet_id: str) -> tuple[int, int]:
     raw_comment_rows = get_values(
         service,
@@ -3010,7 +2997,10 @@ def sync() -> None:
     log_progress("sheets", f"Using spreadsheet {spreadsheet_id}")
 
     known_post_ids, existing_post_last_scanned, existing_posts = existing_post_state(service, spreadsheet_id)
-    known_comment_ids, existing_audience_counts = existing_comment_state(service, spreadsheet_id)
+    known_comment_ids, existing_audience_counts, stored_thread_roots = existing_comment_state(
+        service,
+        spreadsheet_id,
+    )
     log_progress(
         "sheets",
         f"Loaded existing IDs: posts={len(known_post_ids)}, comments={len(known_comment_ids)}, "
@@ -3024,6 +3014,7 @@ def sync() -> None:
         existing_audience_counts,
         existing_post_last_scanned,
         existing_posts,
+        stored_thread_roots,
     )
     if env_bool("ANALYZE_WITH_GEMINI", True):
         discovered_post_count = len(posts)
@@ -3086,9 +3077,6 @@ def sync() -> None:
         f"held_for_deferred_or_unanalyzed_comments={incomplete_post_scans}",
     )
     zeroed_scores = reconcile_brand_thread_response_scores(service, spreadsheet_id)
-    # Prune before the refresh so the counters below are recomputed from what
-    # actually remains, rather than being rewritten again on the next run.
-    prune_expired_content(service, spreadsheet_id)
     refreshed_posts, refreshed_summaries = refresh_derived_metrics(service, spreadsheet_id)
     log_progress(
         "complete",
