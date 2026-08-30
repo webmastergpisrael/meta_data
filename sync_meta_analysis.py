@@ -21,6 +21,7 @@ DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 WRITE_RESERVE_SECONDS = 90
 ANALYSIS_RESERVE_SECONDS = 4 * 60
 SHEETS_API_RETRIES = 3
+SHEET_ROW_GROWTH_INCREMENT = 1000
 
 
 class DeadlineReached(RuntimeError):
@@ -322,7 +323,13 @@ def batch_update(service, spreadsheet_id: str, requests_body: list[dict[str, Any
 def get_spreadsheet(service, spreadsheet_id: str) -> dict[str, Any]:
     return (
         service.spreadsheets()
-        .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title))")
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields=(
+                "sheets(properties(sheetId,title,"
+                "gridProperties(rowCount,columnCount,frozenRowCount)))"
+            ),
+        )
         .execute(num_retries=SHEETS_API_RETRIES)
     )
 
@@ -333,6 +340,57 @@ def find_sheet(metadata: dict[str, Any], title: str) -> dict[str, Any] | None:
         if properties.get("title") == title:
             return properties
     return None
+
+
+def ensure_sheet_grid_capacity(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+    required_rows: int,
+    required_columns: int,
+) -> None:
+    """Expand a sheet before a values update would exceed its grid limits."""
+    metadata = get_spreadsheet(service, spreadsheet_id)
+    sheet = find_sheet(metadata, sheet_name)
+    if not sheet:
+        raise RuntimeError(f"Google Sheet tab not found: {sheet_name}")
+
+    grid = sheet.get("gridProperties", {})
+    current_rows = int(grid.get("rowCount") or 0)
+    current_columns = int(grid.get("columnCount") or 0)
+    requests_body: list[dict[str, Any]] = []
+
+    if required_rows > current_rows:
+        target_rows = max(required_rows, current_rows + SHEET_ROW_GROWTH_INCREMENT)
+        requests_body.append(
+            {
+                "appendDimension": {
+                    "sheetId": sheet["sheetId"],
+                    "dimension": "ROWS",
+                    "length": target_rows - current_rows,
+                }
+            }
+        )
+
+    if required_columns > current_columns:
+        requests_body.append(
+            {
+                "appendDimension": {
+                    "sheetId": sheet["sheetId"],
+                    "dimension": "COLUMNS",
+                    "length": required_columns - current_columns,
+                }
+            }
+        )
+
+    if requests_body:
+        log_progress(
+            "sheets",
+            f"Expanding '{sheet_name}' grid for write: "
+            f"rows={current_rows}->{max(required_rows, current_rows + SHEET_ROW_GROWTH_INCREMENT) if required_rows > current_rows else current_rows}, "
+            f"columns={current_columns}->{max(required_columns, current_columns)}",
+        )
+        batch_update(service, spreadsheet_id, requests_body)
 
 
 def update_values(service, spreadsheet_id: str, range_name: str, values: list[list[Any]]) -> None:
@@ -778,6 +836,13 @@ def upsert_by_key(
             appended += 1
 
     if merged_values:
+        ensure_sheet_grid_capacity(
+            service,
+            spreadsheet_id,
+            sheet_name,
+            required_rows=len(merged_values) + 1,
+            required_columns=len(headers),
+        )
         update_values(
             service,
             spreadsheet_id,
@@ -815,12 +880,20 @@ def append_new_rows(
 
     if additions:
         start_row = len(existing) + 2
+        end_row = start_row + len(additions) - 1
+        ensure_sheet_grid_capacity(
+            service,
+            spreadsheet_id,
+            sheet_name,
+            required_rows=end_row,
+            required_columns=len(headers),
+        )
         update_values(
             service,
             spreadsheet_id,
             sheet_range(
                 sheet_name,
-                f"A{start_row}:{col_letter(len(headers))}{start_row + len(additions) - 1}",
+                f"A{start_row}:{col_letter(len(headers))}{end_row}",
             ),
             additions,
         )
