@@ -1,11 +1,82 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import sync_meta_analysis as sync
 
 
 class MetaAnalysisCollectionTests(unittest.TestCase):
+    def test_sheet_grid_capacity_expands_rows_in_chunks(self):
+        metadata = {
+            "sheets": [
+                {
+                    "properties": {
+                        "sheetId": 17,
+                        "title": "Post/Ad Comments",
+                        "gridProperties": {"rowCount": 6690, "columnCount": 26},
+                    }
+                }
+            ]
+        }
+
+        with (
+            patch.object(sync, "get_spreadsheet", return_value=metadata),
+            patch.object(sync, "batch_update") as batch_update,
+        ):
+            sync.ensure_sheet_grid_capacity(
+                object(),
+                "spreadsheet",
+                "Post/Ad Comments",
+                required_rows=6917,
+                required_columns=20,
+            )
+
+        batch_update.assert_called_once_with(
+            ANY,
+            "spreadsheet",
+            [
+                {
+                    "appendDimension": {
+                        "sheetId": 17,
+                        "dimension": "ROWS",
+                        "length": 1000,
+                    }
+                }
+            ],
+        )
+
+    def test_append_new_rows_ensures_grid_capacity_before_write(self):
+        headers = ["comment_id", "comment_message"]
+        rows = [
+            {"comment_id": "new-1", "comment_message": "First"},
+            {"comment_id": "new-2", "comment_message": "Second"},
+        ]
+
+        with (
+            patch.object(sync, "ensure_sheet"),
+            patch.object(sync, "get_values", return_value=[["existing", "Old"]]),
+            patch.object(sync, "ensure_sheet_grid_capacity") as ensure_capacity,
+            patch.object(sync, "update_values") as update_values,
+        ):
+            result = sync.append_new_rows(
+                object(),
+                "spreadsheet",
+                "Post/Ad Comments",
+                headers,
+                ["comment_id"],
+                rows,
+            )
+
+        ensure_capacity.assert_called_once_with(
+            ANY,
+            "spreadsheet",
+            "Post/Ad Comments",
+            required_rows=4,
+            required_columns=2,
+        )
+        self.assertEqual(update_values.call_args.args[2], "'Post/Ad Comments'!A3:B4")
+        self.assertEqual(result, (0, 2, 3))
+
     def test_oldest_new_comments_are_selected_globally(self):
         comments = [
             {"comment_id": "newest", "comment_created_time": "2026-07-03T00:00:00+00:00"},
