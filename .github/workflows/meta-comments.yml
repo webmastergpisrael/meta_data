@@ -70,3 +70,30 @@ jobs:
           PYTHONUNBUFFERED: "1"
           TIMEZONE: Asia/Jerusalem
         run: python -u sync_meta_analysis.py
+
+  notify-on-failure:
+    name: Email workflow failure
+    needs: sync
+    if: ${{ always() && needs.sync.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send failure notification email
+        uses: dawidd6/action-send-mail@v18
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: webmastergpisrael@gmail.com
+          password: ${{ secrets.SMTP_PASSWORD }}
+          from: Greenpeace Meta Sync <webmastergpisrael@gmail.com>
+          to: tuvalshemer@gmail.com,nreznik@greenpeace.org
+          subject: "Meta data sync failed - run #${{ github.run_number }}"
+          body: |
+            The Meta data sync workflow failed.
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Trigger: ${{ github.event_name }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
