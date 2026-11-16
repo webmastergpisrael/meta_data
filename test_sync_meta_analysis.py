@@ -926,6 +926,7 @@ class OpenAIAnalysisTests(unittest.TestCase):
         config = {
             "gemini_api_mode": "openai",
             "gemini_model": "test-model",
+            "openai_reasoning_effort": "minimal",
             "gemini_max_retries": 1,
             "gemini_quota_exhausted": False,
             "gemini_quota_notice_printed": False,
@@ -948,6 +949,7 @@ class OpenAIAnalysisTests(unittest.TestCase):
         self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer test-key")
         self.assertEqual(post.call_args.kwargs["json"]["model"], "test-model")
+        self.assertEqual(post.call_args.kwargs["json"]["reasoning_effort"], "minimal")
         self.assertEqual(post.call_count, 1)
 
     def test_openai_rate_limit_is_retried(self):

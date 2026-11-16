@@ -240,6 +240,7 @@ CONFIG = {
     "gemini_api_mode": (
         "openai" if env_value("OPENAI_API_KEY") else env_value("GEMINI_API_MODE", "generateContent")
     ),
+    "openai_reasoning_effort": env_value("OPENAI_REASONING_EFFORT", "minimal"),
     "gemini_fallback_after_quota_error": env_bool("GEMINI_FALLBACK_AFTER_QUOTA_ERROR", False),
     "gemini_quota_exhausted": False,
     "gemini_quota_notice_printed": False,
@@ -2420,6 +2421,13 @@ def gemini_request(prompt: str, api_key: str, mode: str) -> tuple[str, dict[str,
                     {"role": "user", "content": prompt},
                 ],
                 "response_format": {"type": "json_object"},
+                # Classification needs little deliberation; the default effort took about
+                # 8 seconds per post and a run ran out of time before reaching the comments.
+                **(
+                    {"reasoning_effort": CONFIG["openai_reasoning_effort"]}
+                    if CONFIG["openai_reasoning_effort"]
+                    else {}
+                ),
             },
             {
                 "Authorization": f"Bearer {api_key}",
