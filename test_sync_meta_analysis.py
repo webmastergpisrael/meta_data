@@ -911,5 +911,57 @@ class MetaAnalysisCollectionTests(unittest.TestCase):
         self.assertEqual(completed[0]["response_value_score"], "")
 
 
+class OpenAIAnalysisTests(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+            self.ok = 200 <= status_code < 300
+            self.text = "x"
+
+        def json(self):
+            return self._data
+
+    def run_openai(self, responses):
+        config = {
+            "gemini_api_mode": "openai",
+            "gemini_model": "test-model",
+            "gemini_max_retries": 1,
+            "gemini_quota_exhausted": False,
+            "gemini_quota_notice_printed": False,
+            "gemini_fallback_on_error": False,
+            "gemini_fallback_after_quota_error": False,
+        }
+        with patch.dict(sync.CONFIG, config), \
+                patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), \
+                patch.object(sync, "analysis_time_available", return_value=True), \
+                patch.object(sync, "remaining_seconds", return_value=600), \
+                patch.object(sync, "sleep_before_gemini_retry"), \
+                patch.object(sync.requests, "post", side_effect=responses) as post:
+            return sync.gemini_generate_json("Analyze this.", {}), post
+
+    def test_openai_reply_is_parsed_and_sent_to_openai(self):
+        reply = {"choices": [{"message": {"content": '{"posts": [{"post_id": "1"}]}'}}]}
+        result, post = self.run_openai([self.FakeResponse(200, reply)])
+        self.assertEqual(result, {"posts": [{"post_id": "1"}]})
+        url = post.call_args.args[0]
+        self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer test-key")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "test-model")
+        self.assertEqual(post.call_count, 1)
+
+    def test_openai_rate_limit_is_retried(self):
+        limited = {"error": {"code": "rate_limit_exceeded", "type": "requests"}}
+        reply = {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        result, post = self.run_openai([self.FakeResponse(429, limited), self.FakeResponse(200, reply)])
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(post.call_count, 2)
+
+    def test_openai_empty_balance_stops_the_run(self):
+        empty = {"error": {"code": "insufficient_quota", "type": "insufficient_quota"}}
+        with self.assertRaises(RuntimeError):
+            self.run_openai([self.FakeResponse(429, empty)])
+
+
 if __name__ == "__main__":
     unittest.main()

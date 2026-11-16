@@ -16,6 +16,7 @@ from googleapiclient.discovery import build
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 RECOMMENDED_RESPONSE_SCORE_THRESHOLD = 0.70
 DEFAULT_MAX_RUNTIME_SECONDS = 15 * 60
 WRITE_RESERVE_SECONDS = 90
@@ -229,8 +230,16 @@ CONFIG = {
     "gemini_max_retries": env_int("GEMINI_MAX_RETRIES", 3),
     "gemini_retry_base_seconds": env_int("GEMINI_RETRY_BASE_SECONDS", 20),
     "gemini_fallback_on_error": env_bool("GEMINI_FALLBACK_ON_ERROR", False),
-    "gemini_model": gemini_model_from_env(),
-    "gemini_api_mode": env_value("GEMINI_API_MODE", "generateContent"),
+    # The analysis runs on OpenAI when OPENAI_API_KEY is set, otherwise on Gemini.
+    # "gemini_model" holds the model name of whichever provider is in use.
+    "gemini_model": (
+        env_value("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        if env_value("OPENAI_API_KEY")
+        else gemini_model_from_env()
+    ),
+    "gemini_api_mode": (
+        "openai" if env_value("OPENAI_API_KEY") else env_value("GEMINI_API_MODE", "generateContent")
+    ),
     "gemini_fallback_after_quota_error": env_bool("GEMINI_FALLBACK_AFTER_QUOTA_ERROR", False),
     "gemini_quota_exhausted": False,
     "gemini_quota_notice_printed": False,
@@ -2304,8 +2313,16 @@ def gemini_generate_json(prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
             CONFIG["gemini_quota_notice_printed"] = True
         return {}
 
-    api_key = required_env("GEMINI_API_KEY")
     primary_mode = CONFIG["gemini_api_mode"]
+    if primary_mode == "openai":
+        result = gemini_generate_json_with_mode(prompt, required_env("OPENAI_API_KEY"), "openai")
+        if result == "__quota_exhausted__":
+            return gemini_fallback_or_raise("OpenAI quota exhausted.")
+        if isinstance(result, dict):
+            return result
+        return gemini_fallback_or_raise("OpenAI did not return valid JSON.")
+
+    api_key = required_env("GEMINI_API_KEY")
     fallback_mode = "interactions" if primary_mode == "generateContent" else "generateContent"
 
     result = gemini_generate_json_with_mode(prompt, api_key, primary_mode)
@@ -2328,8 +2345,10 @@ def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict
     if not analysis_time_available():
         raise DeadlineReached("Gemini analysis deadline reached")
     url, payload, headers = gemini_request(prompt, api_key, mode)
+    label = "OpenAI" if mode == "openai" else f"{label}"
+    provider = "OpenAI" if mode == "openai" else "Gemini"
     print(
-        "Gemini request: "
+        f"{provider} request: "
         f"mode={mode}, "
         f"model={CONFIG['gemini_model']}, "
         f"prompt_chars={len(prompt)}"
@@ -2350,7 +2369,7 @@ def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict
             data = response.json() if response.text else {}
         except (requests.RequestException, ValueError) as exc:
             if attempt >= max_retries:
-                print(f"WARNING: Gemini {mode} request failed: {exc}")
+                print(f"WARNING: {label} request failed: {exc}")
                 return None
             sleep_before_gemini_retry(attempt)
             continue
@@ -2359,24 +2378,55 @@ def gemini_generate_json_with_mode(prompt: str, api_key: str, mode: str) -> dict
             try:
                 return extract_gemini_json(data)
             except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-                print(f"WARNING: Gemini {mode} returned invalid JSON: {exc}")
-                print(f"Gemini {mode} response shape: {gemini_response_shape(data)}")
+                print(f"WARNING: {label} returned invalid JSON: {exc}")
+                print(f"{label} response shape: {gemini_response_shape(data)}")
                 return None
 
         message = json.dumps(data, ensure_ascii=False)[:1000]
+        if mode == "openai" and response.status_code == 429 and not openai_quota_is_exhausted(data):
+            # A plain OpenAI rate limit clears on its own; only an empty balance ends the run.
+            if attempt >= max_retries:
+                print(f"WARNING: {label} API error 429: {message}")
+                return None
+            sleep_before_gemini_retry(attempt)
+            continue
         if response.status_code == 429 and not CONFIG["gemini_fallback_after_quota_error"]:
             CONFIG["gemini_quota_exhausted"] = True
-            print(f"WARNING: Gemini {mode} quota/rate limit error 429: {message}")
+            print(f"WARNING: {label} quota/rate limit error 429: {message}")
             return "__quota_exhausted__"
         if response.status_code not in retryable_statuses or attempt >= max_retries:
-            print(f"WARNING: Gemini {mode} API error {response.status_code}: {message}")
+            print(f"WARNING: {label} API error {response.status_code}: {message}")
             return None
         sleep_before_gemini_retry(attempt)
 
     return None
 
 
+def openai_quota_is_exhausted(data: Any) -> bool:
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return False
+    return "insufficient_quota" in {error.get("code"), error.get("type")}
+
+
 def gemini_request(prompt: str, api_key: str, mode: str) -> tuple[str, dict[str, Any], dict[str, str]]:
+    if mode == "openai":
+        return (
+            "https://api.openai.com/v1/chat/completions",
+            {
+                "model": CONFIG["gemini_model"],
+                "messages": [
+                    {"role": "system", "content": "Reply with a single JSON object and nothing else."},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": {"type": "json_object"},
+            },
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
     if mode == "interactions":
         return (
             "https://generativelanguage.googleapis.com/v1beta/interactions",
@@ -2406,7 +2456,9 @@ def gemini_request(prompt: str, api_key: str, mode: str) -> tuple[str, dict[str,
 
 def extract_gemini_json(data: dict[str, Any]) -> dict[str, Any]:
     text = ""
-    if data.get("candidates"):
+    if data.get("choices"):
+        text = data["choices"][0]["message"]["content"] or ""
+    elif data.get("candidates"):
         text = data["candidates"][0]["content"]["parts"][0]["text"]
     elif data.get("output"):
         for output in data.get("output", []):

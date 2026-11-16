@@ -51,6 +51,9 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # When OPENAI_API_KEY is set, the analysis runs on OpenAI and the Gemini settings are ignored.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5-mini' }}
           META_GRAPH_VERSION: ${{ secrets.META_GRAPH_VERSION }}
           GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-3.1-flash-lite' }}
           GEMINI_API_MODE: ${{ vars.GEMINI_API_MODE || 'generateContent' }}
